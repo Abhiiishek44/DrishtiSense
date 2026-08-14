@@ -46,9 +46,6 @@ Perception that persists beyond the camera frame.
 ---
 
 ## Architecture
-
-<img width="756" height="722" alt="image" src="https://github.com/user-attachments/assets/10d1b262-0d25-4851-898e-619f8e5279a7" />
-
       
 ```
 
