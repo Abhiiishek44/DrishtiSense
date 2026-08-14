@@ -51,12 +51,11 @@ By combining real-time vision, depth estimation, visual odometry, spatial memory
 
 <p align="center">
   <img
-    src="assets/drishtisense-architecture.png"
+    src="https://github.com/user-attachments/assets/669c9124-c080-4004-93f1-71d44afc2e9c"
     alt="DrishtiSense Architecture"
     width="760"
   />
 </p>
-
 DrishtiSense separates latency-sensitive perception from slower memory and reasoning tasks.
 
 ### Perception Loop
