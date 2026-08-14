@@ -47,35 +47,9 @@ Perception that persists beyond the camera frame.
 
 ## Architecture
 
-```text
-Camera
-  │
-  ▼
-Object Detection
-  │
-  ▼
-Tracking ───────────────┐
-  │                     │
-  ▼                     ▼
-Depth Estimation   Visual Odometry
-  │                     │
-  └──────────┬──────────┘
-             ▼
-      3D Spatial State
-             │
-      ┌──────┴──────┐
-      ▼             ▼
- World Model   Spatial Memory
-      │             │
-      └──────┬──────┘
-             ▼
-      Navigation Layer
-             │
-             ▼
-      Safety Validation
-             │
-             ▼
-       Voice Response
+<img width="756" height="722" alt="image" src="https://github.com/user-attachments/assets/10d1b262-0d25-4851-898e-619f8e5279a7" />
+
+      
 ```
 
 DrishtiSense separates latency-sensitive perception from slower memory and reasoning tasks.
