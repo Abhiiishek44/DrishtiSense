@@ -1,490 +1,949 @@
-# Lumina — Embodied Spatial AI for Assistive Navigation
+[DrishtiSense_README.md](https://github.com/user-attachments/files/31081919/DrishtiSense_README.md)
+# DrishtiSense
 
-> **A production-grade Multi-Agent System (MAS) that gives visually impaired users real-time spatial awareness, object memory, and voice-guided navigation — powered by computer vision, monocular depth estimation, and LLM-driven agent negotiation.**
+<p align="center">
+  <strong>Spatial intelligence for safer, more independent mobility.</strong>
+</p>
 
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Architecture](#architecture)
-  - [Event-Driven Pub/Sub Core](#event-driven-pubsub-core)
-  - [Fast Loop vs. Slow Loop](#fast-loop-vs-slow-loop)
-  - [Agent Roster](#agent-roster)
-  - [Subscription Graph](#subscription-graph)
-- [Key Technical Features](#key-technical-features)
-  - [v4.1 Vision Upgrades](#v41-vision-upgrades)
-  - [v5 Architecture Upgrades](#v5-architecture-upgrades)
-- [System Components](#system-components)
-- [Data Models](#data-models)
-- [API & WebSocket Protocol](#api--websocket-protocol)
-- [Configuration](#configuration)
-- [Installation](#installation)
-- [Running the System](#running-the-system)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
+<p align="center">
+  <a href="https://github.com/Abhiiishek44/DrishtiSense/stargazers">
+    <img src="https://img.shields.io/github/stars/Abhiiishek44/DrishtiSense?style=flat-square" alt="GitHub Stars">
+  </a>
+  <a href="https://github.com/Abhiiishek44/DrishtiSense/issues">
+    <img src="https://img.shields.io/github/issues/Abhiiishek44/DrishtiSense?style=flat-square" alt="GitHub Issues">
+  </a>
+  <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/FastAPI-Async-009688?style=flat-square&logo=fastapi&logoColor=white" alt="FastAPI">
+  <img src="https://img.shields.io/badge/Status-Experimental-orange?style=flat-square" alt="Status">
+</p>
 
 ---
 
-## Overview
+## What is DrishtiSense?
 
-Lumina is a real-time assistive navigation system designed for visually impaired users. It uses a camera feed (local webcam or IP camera) to continuously perceive the environment, build a persistent spatial memory, and respond to natural-language queries like _"Where is my phone?"_ or _"Find my bottle"_ with spoken, clock-direction navigation instructions.
+**DrishtiSense** is an open-source spatial AI system built to help visually impaired users understand, remember, and navigate their physical surroundings through computer vision and natural voice interaction.
 
-The system is built around a true **Multi-Agent System (MAS)** architecture — six autonomous agents communicate exclusively through a central Pub/Sub event bus with no direct inter-agent coupling. This enables genuine agent autonomy, fault isolation, and emergent negotiation behaviour.
+Most camera-based assistants answer a simple question:
 
-**Core capabilities:**
+> **“What can the camera see right now?”**
 
-- Real-time object detection and multi-object tracking (YOLOv8 + IoU tracker)
-- Monocular depth estimation with RANSAC multi-anchor metric calibration (MiDaS)
-- 3D spatial back-projection (X, Y, Z camera-coordinate vectors)
-- Persistent spatial memory with probabilistic confidence decay (Qdrant vector DB)
-- Illumination-invariant visual Re-ID for cross-frame object deduplication
-- Bird's-Eye View occupancy grid for safe lateral obstacle avoidance
-- ORB-SLAM visual odometry compass (drift-free heading without IMU)
-- LLM-driven query parsing and natural-language response generation
-- LLM cascade: Groq → OpenAI → Local edge SLM (llama.cpp / Ollama) → deterministic fallback
-- Real-time WebSocket streaming of annotated frames, agent logs, and navigation responses
-- Cross-session persistent user memory
+DrishtiSense explores a harder one:
+
+> **“What do I know about the space around the user, what has changed, and what should the user do next?”**
+
+The system combines real-time perception, depth estimation, object tracking, spatial memory, visual odometry, safety-aware navigation, and a multi-agent reasoning layer to turn camera observations into useful guidance.
+
+Instead of only reporting:
+
+```text
+Bottle detected
+```
+
+DrishtiSense aims to support interactions such as:
+
+```text
+User: Where is my bottle?
+
+DrishtiSense:
+I last saw your bottle near the table behind you.
+Turn slightly right and I can guide you toward it.
+```
+
+The project is designed around one central idea:
+
+> **Perception should not disappear when an object leaves the camera frame.**
 
 ---
 
-## Architecture
+## Why this matters
 
-### Event-Driven Pub/Sub Core
+For a visually impaired user, recognizing an object is only part of the problem.
 
-Lumina v5 replaces the v4 procedural orchestrator with a fully async Pub/Sub architecture. All inter-agent communication goes through a single `EventBus` — agents never call each other directly.
+Useful environmental awareness also requires understanding:
 
-```
-                          ┌─────────────────────────────────────────┐
-                          │             EventBus (Pub/Sub)           │
-                          │                                          │
-  Camera Frame ──────────►│ vision/new_frame                         │
-                          │ hardware/emergency_stop  (high priority) │
-  User Query  ──────────►│ system/query_received                    │
-                          │ memory/candidates_ready                  │
-                          │ memory/write_approved                    │
-                          │ memory/search_result                     │
-                          │ memory/confidence_low                    │
-                          │ navigation/route_proposed                │
-                          │ navigation/route_rejected                │
-                          │ navigation/route_approved                │
-                          │ navigation/route_final   ───────────────►│ WebSocket
-                          │ system/agent_log         ───────────────►│ Clients
-                          │ system/request_camera_pan                │
-                          └─────────────────────────────────────────┘
+- **what** is nearby,
+- **where** it is,
+- **how far away** it is,
+- **whether it is moving**,
+- **whether it blocks the user's path**,
+- **where it was last seen**,
+- **whether the environment has changed**, and
+- **what action the user should take next**.
+
+Traditional object detectors are usually frame-oriented:
+
+```text
+Camera → Detect → Report → Forget
 ```
 
-**Why Pub/Sub?**
-In v4, the orchestrator called agents `A → B → C → D` sequentially — a conductor pattern that is definitionally **not** a multi-agent system. v5 satisfies both MAS properties:
+DrishtiSense instead works toward persistent spatial understanding:
 
-1. **Autonomy** — each agent decides _for itself_ when to act, based on what it perceives from the bus.
-2. **Decentralisation** — no single component holds the global control flow at runtime.
-
-The EventBus supports:
-- Wildcard subscriptions (`navigation/*`)
-- Two-tier priority dispatch (hardware reflexes bypass the queue)
-- Per-topic event history ring buffer (last 20 events)
-- Dead-letter logging for unsubscribed topics
-- Thread-safe `publish_nowait()` for camera callback contexts
-
-### Fast Loop vs. Slow Loop
-
-```
-FAST LOOP (30 FPS — ~33ms budget, NEVER awaits LLM)
-┌─────────────────────────────────────────────────────────────────────┐
-│  Camera capture → ORB-SLAM heading → YOLO detect → IoU track       │
-│  → RANSAC depth calibration → 3D back-projection                    │
-│  → BEV occupancy grid update → SafetyCortex                         │
-│  → publish "vision/new_frame"      (triggers ArchivistAgent)        │
-│  → publish "hardware/emergency_stop" if obstacle < 1m (HIGH PRIO)  │
-└─────────────────────────────────────────────────────────────────────┘
-
-SLOW LOOP (1–3 FPS equivalent — EventBus async dispatcher)
-┌─────────────────────────────────────────────────────────────────────┐
-│  ArchivistAgent    → packages SpatialMemory candidates              │
-│  JanitorAgent      → deduplicates via Re-ID + spatial proximity     │
-│  LibrarianAgent    → vector DB search + confidence decay            │
-│  CoordinatorAgent  → computes 3D navigation + composes LLM response │
-│  CriticAgent       → validates route, negotiates avoidance          │
-│  AvoiderAgent      → builds detour speech from waypoints            │
-└─────────────────────────────────────────────────────────────────────┘
+```text
+Perceive → Track → Understand → Remember → Validate → Guide
 ```
 
-The fast loop uses `asyncio.create_task()` for all bus publications, ensuring it **never blocks** on LLM latency or cognitive agent processing time.
-
-### Agent Roster
-
-| Agent | Subscribes To | Publishes To | Role |
-|---|---|---|---|
-| **ArchivistAgent** | `vision/new_frame` | `memory/candidates_ready` | Packages detected objects as `SpatialMemory` candidates with 3D vectors and Re-ID embeddings |
-| **JanitorAgent** | `memory/candidates_ready` | `memory/write_approved` | Deduplicates candidates via Re-ID cosine distance, track-ID windowing, and spatial proximity fallback |
-| **LibrarianAgent** | `system/query_received` | `memory/search_result`, `memory/confidence_low`, `system/request_camera_pan` | Exact + semantic Qdrant search; triggers active perception on low-confidence hits |
-| **CoordinatorAgent** | `memory/search_result`, `navigation/route_rejected` | `navigation/route_proposed`, `navigation/route_final` | Parses queries (deterministic + LLM), computes 3D azimuth navigation, composes spoken responses |
-| **CriticAgent** | `navigation/route_proposed` | `navigation/route_approved`, `navigation/route_rejected` | Validates confidence, staleness, and obstacle proximity; attaches avoidance waypoints instead of hard halts |
-| **AvoiderAgent** | `hardware/safety_warning` | `navigation/route_final` | Computes grid-verified lateral strafe instructions; outputs spoken detour guidance |
-
-### Subscription Graph
-
-```
-vision/new_frame            ──► ArchivistAgent.on_new_frame
-memory/candidates_ready     ──► JanitorAgent.on_candidates_ready
-system/query_received       ──► LibrarianAgent.on_query_received
-memory/search_result        ──► CoordinatorAgent.on_search_result
-navigation/route_proposed   ──► CriticAgent.on_route_proposed
-navigation/route_rejected   ──► CoordinatorAgent.on_route_rejected
-hardware/safety_warning     ──► AvoiderAgent.on_safety_warning
-```
-
-Agent negotiation is emergent: the Coordinator proposes a route, the Critic approves or rejects with a reason, and the Coordinator re-plans autonomously — up to 3 rounds — without the orchestrator's involvement.
+That shift—from isolated detections to a continuously updated world model—is the foundation of the project.
 
 ---
 
-## Key Technical Features
+## Core experience
 
-### v4.1 Vision Upgrades
+### 1. See
 
-#### Fix 1 — Multi-Anchor RANSAC Depth Calibration
-Replaces single-object depth anchoring (which was corrupted by one wrong-height detection) with a RANSAC consensus across all confirmed tracks per frame. Scale is only updated when ≥3 anchors agree within a 15% tolerance window. The accepted scale is further smoothed by a 1D Kalman filter to suppress frame-to-frame jitter.
+Continuously perceive the environment using object detection, tracking, depth estimation, and spatial projection.
 
-#### Fix 2 — Illumination-Invariant Re-ID (LAB + LBP + Spatial Pyramid)
-Replaces raw HSV colour histograms with a 128-dimensional fused descriptor:
-- **LAB chroma histogram (48-d):** bins only `a*` and `b*` channels, deliberately discarding `L*` (luminance) to eliminate sensitivity to lighting changes.
-- **LBP texture descriptor (40-d):** Local Binary Patterns encode micro-texture structurally — invariant to colour and illumination.
-- **3×3 spatial pyramid colour layout (40-d):** encodes _where_ colours appear in the object, separating objects with identical colour distributions but different spatial structure.
-
-Final descriptor is L2-normalised. Same-object threshold: cosine distance < 0.20.
-
-#### Fix 3 — Bird's-Eye Occupancy Grid (Dense Floor Map)
-`BEVOccupancyGrid` back-projects every detected bounding box bottom edge into world-floor XZ space. Maintains a 2D grid (free / occupied / unknown). Before proposing any lateral strafe, the avoidance engine queries the grid for a clear corridor. Unknown cells are treated as unsafe (conservative / safe-fail). Free cells decay to unknown after 3 seconds for dynamic environments.
-
-#### Fix 4 — ORB-SLAM Visual Compass (Drift-Free Heading)
-Replaces cumulative optical-flow integration (unbounded drift) with a full Visual Odometry pipeline: ORB feature extraction → FLANN matching with Lowe ratio test → RANSAC Essential Matrix → `cv2.recoverPose()` for R and t → yaw extraction from the rotation matrix. Keyframe-based loop-closure detection soft-resets accumulated drift whenever the scene is revisited.
-
-### v5 Architecture Upgrades
-
-- **EventBus with two-tier dispatch** — hardware reflexes on `hardware/*` topics bypass the async queue and are dispatched immediately via `create_task()`. LLM-based agents cannot block the safety-critical path.
-- **Agent registration pattern** — `agent.register()` attaches all subscriptions in one place. The subscription topology is fully visible and auditable in the orchestrator's `_register_agents()` method.
-- **Active perception** — `LibrarianAgent` publishes `system/request_camera_pan` when effective memory confidence falls below 30%, signalling the system that it needs better sensory data. Agents are actors that shape their environment, not just passive processors.
-- **Probabilistic memory permanence** — confidence decays exponentially with a 2-hour half-life rather than a hard 30-minute cliff. Memories never reach zero confidence; they become increasingly uncertain.
-- **Orchestrator as bootstrap** — after `start()` returns, the orchestrator does nothing except feed camera frames to the bus at 30 FPS. All runtime behaviour is emergent.
-
----
-
-## System Components
-
-| Component | Class | Description |
-|---|---|---|
-| Camera Manager | `CameraManager` | Unified local/IP camera source with automatic reconnection and test pattern fallback |
-| Visual SLAM Compass | `VisualSLAMCompass` | ORB-SLAM visual odometry with FLANN matching and loop-closure drift correction |
-| YOLO Detector | `YOLODetector` | YOLOv8 COCO + optional YOLOWorld open-vocabulary detection |
-| IoU Tracker | `IoUTracker` | Frame-to-frame bounding box association with Kalman-smoothed depth |
-| Monocular Depth Engine | `MonocularDepthEngine` | MiDaS DPT-Small via ONNX Runtime or PyTorch; RANSAC multi-anchor metric calibration |
-| Depth Fusion Engine | `DepthFusionEngine` | Per-track depth Kalman filter + 3D back-projection |
-| Re-ID Extractor | `ReIDExtractor` | 128-d LAB+LBP+spatial pyramid descriptor extraction |
-| BEV Occupancy Grid | `BEVOccupancyGrid` | 10cm-resolution 2D floor map with free-cell decay |
-| Dynamic Avoidance Engine | `DynamicAvoidanceEngine` | Grid-verified lateral strafe waypoint computation |
-| Safety Cortex | `SafetyCortex` | Multi-level danger alerting (critical / warning / caution) with avoidance integration |
-| World Model | `WorldModel` | Live scene graph with temporal state transitions and event log |
-| Spatial Database | `SpatialDatabase` | Qdrant-backed memory with exact + semantic search, probabilistic confidence decay |
-| LLM Client | `LLMClient` | Groq → OpenAI → Edge SLM → deterministic cascade, never raises |
-| Edge LLM Backend | `EdgeLLMBackend` | llama.cpp (GGUF) and Ollama local inference backends |
-| Event Bus | `EventBus` | Fully async Pub/Sub broker with wildcard subscriptions, priority dispatch, dead-letter logging |
-
----
-
-## Data Models
-
-### Core Spatial Types
-
-```python
-# 3D object position in camera space
-TrackedDetection:
-    translation_x: float    # metres right of camera axis
-    translation_y: float    # metres below camera axis
-    translation_z: float    # metres forward (depth)
-    azimuth_deg: float      # θ = arctan2(X, Z) in degrees
-    reid_embedding: List[float]  # 128-d Re-ID descriptor
-
-# Persistent spatial memory entry (stored in Qdrant)
-SpatialMemory:
-    label, confidence, original_confidence
-    angle_abs, distance_m
-    translation_x, translation_y, translation_z, azimuth_deg
-    reid_embedding
-    memory_half_life_hours  # per-object decay rate
-    timestamp, session_id, user_id
-
-# Navigation output
-SpatialResult:
-    clock_direction: str       # e.g. "2 o'clock"
-    turn_instruction: str      # e.g. "Turn right"
-    distance_str: str          # e.g. "1.4 metres"
-    confidence: float          # probabilistically decayed
-    is_stale: bool
-    stale_message: str
-
-# Dynamic obstacle detour
-AvoidanceWaypoint:
-    strafe_direction: "left" | "right"
-    strafe_distance_m: float
-    forward_clearance_m: float
-    clock_instruction: str
+```text
+Chair
+0.9 m
+Ahead-right
+Visible now
 ```
 
-### Probabilistic Memory Permanence
+### 2. Remember
 
-```python
-def probabilistic_confidence(original_confidence, age_seconds, half_life_hours=2.0):
-    """
-    Exponential decay: at age=0 → original_confidence
-                       at age=half_life → original_confidence * 0.5
-                       at age=8h → ~original_confidence * 0.06 (never zero)
-    """
-    decayed = original_confidence * exp(-0.693 * age_seconds / (half_life_hours * 3600))
-    return max(0.05, decayed)
+Retain useful spatial information after an object leaves the current camera view.
+
+```text
+Bottle
+Last seen near the table
+2.1 m
+Behind-right
+Memory confidence: good
+```
+
+### 3. Navigate
+
+Turn spatial information into simple instructions rather than exposing raw telemetry.
+
+```text
+↻ Turn right
+
+↑ Walk straight · 1.8 m
+
+↖ Move slightly left
+
+STOP · Obstacle ahead
+
+✓ Target reached
 ```
 
 ---
 
-## API & WebSocket Protocol
+## Demo scenario
 
-### REST Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | System health, session ID, connection count |
-| `GET` | `/status` | LLM provider health, camera, Qdrant, depth engine, tracker stats |
-| `GET` | `/memory` | Recent spatial memory snapshot with effective confidence |
-| `GET` | `/scene` | Live world model: active tracks, recent state-change events |
-| `GET` | `/find-object/{label}` | Persisted object position relative to the current camera pose |
-| `GET` | `/safe-path` | Prototype left/center/right free-space estimate for the camera UI |
-| `POST` | `/camera-pose` | Metric ARCore/VIO pose: `x`, `y`, `z`, `yaw_deg`, `source` |
-
-`/find-object/bottle` returns whether the object is currently visible, its
-current relative distance/direction, last-seen age, and stored world
-coordinates. On Android, send ARCore's metric pose to `/camera-pose`; desktop
-uses the existing visual-SLAM heading as a stationary-origin fallback.
-
-### WebSocket — `/ws`
-
-**Client → Server messages:**
-
-```jsonc
-// Natural-language object query
-{ "type": "query", "text": "where is my phone?" }
-
-// Set open-vocabulary detection targets (YOLOWorld)
-{ "type": "set_open_vocab", "classes": ["coffee mug", "charger"] }
-
-// Keepalive
-{ "type": "ping" }
+```text
+1. Camera detects a bottle
+        ↓
+2. Bottle position is stored in spatial memory
+        ↓
+3. User turns away and the bottle leaves the camera view
+        ↓
+4. User asks: "Where is my bottle?"
+        ↓
+5. DrishtiSense resolves the remembered target
+        ↓
+6. User says: "Take me there"
+        ↓
+7. Navigation guidance begins
+        ↓
+8. A chair appears in the route
+        ↓
+9. Safety layer interrupts the route
+        ↓
+10. User is guided around the obstacle
+        ↓
+11. Bottle is visually reacquired
+        ↓
+12. Target position is corrected and navigation completes
 ```
 
-**Server → Client message types:**
+The goal is not to build another object-detection dashboard.
 
-| Type | Description |
+The goal is to build a system that can maintain **spatial continuity** while the user and camera move.
+
+---
+
+# Architecture
+
+DrishtiSense uses an asynchronous, event-driven architecture.
+
+Latency-sensitive perception and safety logic are kept separate from slower reasoning and language-model operations.
+
+```text
+                         ┌────────────────────┐
+                         │      Camera        │
+                         └─────────┬──────────┘
+                                   │
+                                   ▼
+                         ┌────────────────────┐
+                         │    Perception      │
+                         │ Detection + Depth  │
+                         │ Tracking + Pose    │
+                         └─────────┬──────────┘
+                                   │
+                                   ▼
+                         ┌────────────────────┐
+                         │    World Model     │
+                         └─────────┬──────────┘
+                                   │
+                    ┌──────────────┴──────────────┐
+                    │                             │
+                    ▼                             ▼
+             Spatial Memory                 Safety Cortex
+                    │                             │
+                    ▼                             │
+              Agent System                       │
+                    │                             │
+                    └──────────────┬──────────────┘
+                                   ▼
+                           Navigation Engine
+                                   │
+                                   ▼
+                            Voice Guidance
+```
+
+---
+
+## Fast loop vs. cognitive loop
+
+### Fast loop
+
+```text
+Camera Capture
+      ↓
+Visual Odometry
+      ↓
+Object Detection
+      ↓
+Object Tracking
+      ↓
+Depth Estimation
+      ↓
+3D Projection
+      ↓
+Occupancy Update
+      ↓
+Safety Evaluation
+```
+
+This path handles information that should not wait for an LLM.
+
+### Cognitive loop
+
+```text
+Spatial Memory
+      ↓
+Retrieval
+      ↓
+Goal Resolution
+      ↓
+Route Proposal
+      ↓
+Route Validation
+      ↓
+Natural-Language Guidance
+```
+
+> **A slow language-model call must never delay a safety-critical warning.**
+
+---
+
+# Multi-Agent System
+
+DrishtiSense uses specialized agents with explicit responsibilities and event-driven communication.
+
+| Agent | Responsibility |
 |---|---|
-| `frame` | Annotated JPEG (base64) + detection list + compass heading + bus stats |
-| `response` | Final navigation text, clock direction, distance, confidence, avoidance vector |
-| `safety_alert` | Level (critical/warning/caution), label, distance, clock direction |
-| `agent_log` | Per-agent log emission with level and metadata |
-| `memory_update` | Updated memory snapshot after new writes |
-| `world_update` | Active object list + recent state-change events |
-| `system_status` | All component health flags + MAS topology info |
-| `camera_pan_request` | Active perception signal: agent requesting camera repositioning |
-| `avoidance` | Detour instruction: strafe direction, distance, obstacle info |
+| **Archivist** | Converts current perception into candidate spatial memories |
+| **Janitor** | Deduplicates observations using tracking, Re-ID, and spatial proximity |
+| **Librarian** | Retrieves stored objects and evaluates memory confidence |
+| **Coordinator** | Resolves user intent and proposes navigation actions |
+| **Critic** | Validates proposed guidance against safety and memory reliability |
+| **Avoider** | Produces local obstacle-avoidance guidance |
 
-The dashboard's **Scan home** button runs one high-resolution open-vocabulary
-pass across common household objects (furniture, appliances, kitchenware,
-electronics, personal items, and clothing). Use a focused target such as
-`shirt` or `phone charger` for continuous tracking after the initial scan.
+Agents communicate through a Pub/Sub event bus rather than tightly calling one another.
+
+This provides:
+
+- loose coupling,
+- asynchronous execution,
+- fault isolation,
+- observable event flow,
+- independent route validation,
+- priority handling for safety events.
 
 ---
 
-## Configuration
+# Spatial intelligence pipeline
 
-All settings are loaded from a `.env` file via `pydantic-settings`. Key variables:
+```text
+Camera Frame
+     │
+     ▼
+┌───────────────┐
+│     YOLO      │
+│   Detection   │
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│ Object Track  │
+└───────┬───────┘
+        │
+   ┌────┴────┐
+   │         │
+   ▼         ▼
+ Depth     Visual
+ Engine    Odometry
+   │         │
+   └────┬────┘
+        ▼
+  3D Projection
+        │
+   ┌────┴─────────┐
+   │              │
+   ▼              ▼
+World Model   Spatial Memory
+   │              │
+   └──────┬───────┘
+          ▼
+    Goal Resolution
+          │
+          ▼
+     Path Guidance
+          │
+          ▼
+    Safety Validation
+          │
+          ▼
+     Voice Response
+```
+
+---
+
+# Technical capabilities
+
+## Real-time object perception
+
+DrishtiSense uses real-time object detection with multi-object tracking to maintain continuity across frames.
+
+The system can maintain:
+
+- object label,
+- detection confidence,
+- tracking identity,
+- bounding box,
+- estimated depth,
+- 3D camera-relative position,
+- direction / azimuth.
+
+The user-facing interface intentionally converts these values into human guidance instead of exposing raw model outputs.
+
+---
+
+## Monocular depth estimation
+
+A monocular depth model can estimate relative scene depth from a single camera, but relative depth does not automatically equal accurate metric distance.
+
+DrishtiSense improves distance stability using:
+
+- multi-anchor calibration,
+- RANSAC consensus,
+- temporal smoothing,
+- per-track filtering,
+- tracked-object history.
+
+The purpose is to reduce frame-to-frame distance jumps and produce more stable navigation information.
+
+---
+
+## 3D spatial projection
+
+```text
+2D Detection
+    ↓
+Depth Estimate
+    ↓
+Camera Projection
+    ↓
+(X, Y, Z)
+    ↓
+Relative Distance + Bearing
+```
+
+These spatial representations are used by memory and navigation rather than relying on a language model to estimate geometry.
+
+---
+
+## Persistent spatial memory
+
+A spatial memory can include:
+
+```python
+SpatialMemory:
+    label
+    confidence
+    original_confidence
+
+    translation_x
+    translation_y
+    translation_z
+
+    distance_m
+    direction
+    azimuth_deg
+
+    reid_embedding
+
+    timestamp
+    session_id
+    user_id
+```
+
+This enables the system to answer queries about recently observed objects even when they are not currently visible.
+
+---
+
+## Confidence-aware memory
+
+```text
+Fresh observation
+      ↓
+High confidence
+      ↓
+Good confidence
+      ↓
+Moderate confidence
+      ↓
+Low-confidence memory
+      ↓
+Request better perception
+```
+
+This allows the system to respond naturally to stale information instead of treating every stored memory as certain.
+
+---
+
+## Visual Re-Identification
+
+DrishtiSense uses appearance and spatial signals to help associate new detections with existing memories.
+
+The Re-ID representation combines:
+
+- LAB chroma information,
+- Local Binary Pattern texture,
+- spatial color layout,
+- spatial proximity,
+- recent tracking history.
+
+This helps reduce duplicate memories for the same physical object.
+
+---
+
+## Visual odometry
+
+The desktop pipeline uses ORB-based visual odometry:
+
+```text
+ORB Features
+     ↓
+Feature Matching
+     ↓
+RANSAC Essential Matrix
+     ↓
+Camera Pose Recovery
+     ↓
+Relative Heading
+```
+
+For mobile deployment, metric pose information can be supplied through ARCore or another Visual-Inertial Odometry source.
+
+---
+
+## Bird's-Eye occupancy representation
+
+```text
+Top-down view
+
+        obstacle
+          ███
+
+      █████████
+      █ clear █
+      █████████
+
+         USER
+```
+
+The navigation layer can query this representation before suggesting lateral motion.
+
+---
+
+## Goal-based navigation
+
+```text
+"Take me to my bottle"
+          │
+          ▼
+     Resolve Target
+          │
+    ┌─────┴─────┐
+    │           │
+ Visible     Remembered
+    │           │
+    └─────┬─────┘
+          ▼
+   Target Position
+          │
+          ▼
+ Navigation Vector
+          │
+          ▼
+ Safety Validation
+          │
+          ▼
+   Voice Guidance
+```
+
+Distance, heading, and direction come from the spatial pipeline.
+
+The LLM is responsible for **communication**, not physical measurement.
+
+---
+
+## Active perception
+
+```text
+Object Query
+    ↓
+Memory Found
+    ↓
+Confidence Too Low
+    ↓
+Request New Observation
+    ↓
+Re-detect
+    ↓
+Update Memory
+```
+
+The system can request more visual evidence rather than confidently responding from weak memory.
+
+---
+
+## Focused object search
+
+```text
+User Target
+    ↓
+YOLO-World
+    ↓
+Grounding DINO
+    ↓
+Optional SAM2 Refinement
+    ↓
+Temporal Tracking
+```
+
+This creates two perception modes:
+
+1. continuous environmental awareness,
+2. targeted object search.
+
+---
+
+# Safety model
+
+Safety events take priority over normal navigation.
+
+```text
+Target straight ahead
+        ↑
+
+      Chair
+       ⚠
+
+      User
+```
+
+Instead of continuing to say:
+
+> “Walk straight.”
+
+the safety layer can interrupt:
+
+> **“Stop. A chair is blocking your path. Move slightly left.”**
+
+Navigation and safety are treated as separate problems:
+
+```text
+Goal Direction
+      +
+Obstacle Map
+      ↓
+Safe Immediate Action
+```
+
+---
+
+# API
+
+## REST endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Service health and active connections |
+| `GET` | `/status` | Runtime component status |
+| `GET` | `/memory` | Spatial-memory snapshot |
+| `GET` | `/scene` | Current world-model state |
+| `GET` | `/find-object/{label}` | Locate a visible or remembered object |
+| `GET` | `/safe-path` | Lightweight local free-space estimate |
+| `POST` | `/camera-pose` | Supply metric camera/VIO pose |
+
+Example:
+
+```http
+GET /find-object/bottle
+```
+
+Possible response:
+
+```json
+{
+  "object": "bottle",
+  "visible": false,
+  "distance_m": 2.1,
+  "direction": "behind-right",
+  "last_seen": "12 seconds ago"
+}
+```
+
+---
+
+## WebSocket
+
+```text
+/ws
+```
+
+The real-time channel can stream:
+
+- camera frames,
+- detections,
+- navigation responses,
+- safety alerts,
+- memory updates,
+- world-model events,
+- agent activity,
+- active-perception requests.
+
+Example:
+
+```json
+{
+  "type": "query",
+  "text": "where is my bottle?"
+}
+```
+
+---
+
+# Technology stack
+
+| Layer | Technology |
+|---|---|
+| **API** | FastAPI, Uvicorn |
+| **Computer Vision** | OpenCV, YOLOv8 |
+| **Open-Vocabulary Detection** | YOLO-World |
+| **Focused Detection** | Grounding DINO |
+| **Segmentation** | Optional SAM2 |
+| **Depth Estimation** | MiDaS |
+| **Tracking** | IoU + Kalman filtering |
+| **Visual Odometry** | ORB, FLANN, Essential Matrix |
+| **Spatial Memory** | Qdrant |
+| **Embeddings** | Sentence Transformers |
+| **Agent Runtime** | Python asyncio + EventBus |
+| **Cloud LLM** | Groq / OpenAI |
+| **Edge LLM** | llama.cpp / Ollama |
+| **Validation** | Pydantic |
+
+---
+
+# Quick start
+
+## Prerequisites
+
+- Python 3.10+
+- Qdrant
+- Webcam or IP camera
+- Optional CUDA-capable GPU
+
+## Clone
+
+```bash
+git clone https://github.com/Abhiiishek44/DrishtiSense.git
+cd DrishtiSense
+```
+
+## Create environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Windows:
+
+```bash
+.venv\Scripts\activate
+```
+
+## Install dependencies
+
+```bash
+pip install fastapi "uvicorn[standard]" pydantic pydantic-settings \
+  opencv-python-headless ultralytics qdrant-client \
+  sentence-transformers groq openai
+```
+
+Optional depth runtime:
+
+```bash
+pip install torch torchvision
+```
+
+or:
+
+```bash
+pip install onnxruntime
+```
+
+## Start Qdrant
+
+```bash
+docker run --name drishtisense-qdrant -p 6333:6333 qdrant/qdrant
+```
+
+## Configure
+
+```bash
+cp .env.example .env
+```
+
+Example:
 
 ```env
-# LLM — Cloud (cascade order: Groq → OpenAI)
 GROQ_API_KEY=
 OPENAI_API_KEY=
-GROQ_MODEL=llama3-70b-8192
-OPENAI_MODEL=gpt-4o
 
-# LLM — Local Edge (optional; llama_cpp or ollama)
-EDGE_LLM_BACKEND=none          # "llama_cpp" | "ollama" | "none"
-EDGE_LLM_MODEL_PATH=           # path to .gguf file
-EDGE_LLM_MODEL_NAME=           # e.g. "phi3:mini" for ollama
+CAMERA_MODE=local
+CAMERA_INDEX=0
 
-# Qdrant Vector Database
-QDRANT_HOST=localhost
-QDRANT_PORT=6333
-
-# Vision
 YOLO_MODEL=yolov8n.pt
 DETECTION_CONFIDENCE=0.50
-# More sensitive/high-resolution open-vocabulary pass for custom targets
-OPEN_VOCAB_CONFIDENCE=0.20
-OPEN_VOCAB_IMAGE_SIZE=960
-HOME_SCAN_CONFIDENCE=0.35
-WORLD_MEMORY_PATH=lumina_world_memory.json
-VISION_FPS=8
 
-# Camera Source
-CAMERA_MODE=local              # "local" | "ip"
-CAMERA_INDEX=0
-CAMERA_IP_URL=                 # e.g. http://192.168.1.5:8080/video
-
-# Depth Engine
-DEPTH_ENGINE_ENABLED=true
-DEPTH_ONNX_MODEL_PATH=         # optional: path to midas_v21_small_256.onnx
-
-# Spatial Memory
-MEMORY_DECAY_HALF_LIFE_HOURS=2.0
-CRITIC_CONFIDENCE_THRESHOLD=0.60
+QDRANT_HOST=localhost
+QDRANT_PORT=6333
 CROSS_SESSION_ENABLED=true
-USER_ID=default_user
 
-# Safety Distances (metres)
 SAFETY_CRITICAL_DIST=0.8
 SAFETY_WARNING_DIST=1.5
 SAFETY_CAUTION_DIST=2.5
 ```
 
-### IP Camera Setup
-
-Lumina supports phone cameras as the input source via any MJPEG or RTSP app on the same Wi-Fi network:
-
-| App | Platform | URL Format |
-|---|---|---|
-| IP Webcam | Android | `http://<phone-ip>:8080/video` |
-| DroidCam | Android / iOS | `http://<phone-ip>:4747/video` |
-| iVCam / EpocCam | iOS | `rtsp://<phone-ip>:8554/live` |
-
-Set `CAMERA_MODE=ip` and `CAMERA_IP_URL=<url>` in `.env`. The stream reconnects automatically on drop-out.
-
----
-
-## Installation
-
-### Prerequisites
-
-- Python 3.10+
-- [Qdrant](https://qdrant.tech/documentation/quick-start/) running locally (Docker recommended)
-- (Optional) CUDA-capable GPU for faster depth inference
-
-### Steps
+## Run
 
 ```bash
-# 1. Clone the repository
-git clone <https://github.com/DhruvArora1210/LUMINA>
-cd lumina
-
-# 2. Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-
-# 3. Install dependencies
-pip install fastapi uvicorn[standard] pydantic pydantic-settings \
-    opencv-python-headless ultralytics qdrant-client \
-    sentence-transformers groq openai
-
-# Optional: monocular depth (PyTorch path)
-pip install torch torchvision
-
-# Optional: ONNX depth engine (lighter, faster)
-pip install onnxruntime   # or onnxruntime-gpu
-
-# Optional: local edge LLM
-pip install llama-cpp-python   # for llama_cpp backend
-# OR: install Ollama from https://ollama.ai
-
-# 4. Start Qdrant
-docker run -p 6333:6333 qdrant/qdrant
-
-# 5. Copy and configure environment
-cp .env.example .env
-# Edit .env with your API keys and settings
-
-# 6. (Optional) Download MiDaS ONNX model for offline depth
-# Place midas_v21_small_256.onnx at the path set in DEPTH_ONNX_MODEL_PATH
-```
-
----
-
-## Running the System
-
-```bash
-# Development
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-
-# Production
-python main.py
-```
-
-The WebSocket endpoint is available at `ws://localhost:8000/ws`.
-
-Connect a frontend or use a WebSocket client to send queries and receive real-time navigation responses.
-
----
-
-## Tech Stack
-
-| Layer | Technology |
-|---|---|
-| **Web Framework** | FastAPI + Uvicorn |
-| **Computer Vision** | OpenCV, YOLOv8 (Ultralytics), MiDaS (Intel) |
-| **Object Tracking** | Custom IoU Tracker + Kalman depth filter |
-| **Visual Odometry** | ORB-SLAM pipeline via OpenCV |
-| **Vector Database** | Qdrant with sentence-transformers embeddings |
-| **LLM (Cloud)** | Groq (llama3-70b) + OpenAI (GPT-4o) |
-| **LLM (Edge)** | llama.cpp (GGUF) / Ollama |
-| **Data Validation** | Pydantic v2 |
-| **Async Runtime** | Python asyncio |
-| **Depth Estimation** | MiDaS DPT-Small via ONNX Runtime or PyTorch |
-
----
-
-## Project Structure
-
-```
-lumina/
-├── main.py            # FastAPI app, LLM client, Settings, SpatialDatabase
-├── orchestrator.py    # Bootstrap orchestrator — wires components and starts loops
-├── agents.py          # Six autonomous EventBus-native agents + WorldModel
-├── event_bus.py       # Async Pub/Sub broker + all payload type definitions
-├── vision.py          # Camera, YOLO, tracker, depth, Re-ID, BEV grid, SLAM compass
-├── models.py          # All Pydantic/dataclass data models, spatial math utilities
-└── .env               # Environment configuration (not committed)
 ```
 
 ---
 
-## Design Principles
+# Phone camera
 
-**Safety-first dispatch** — emergency stop events are published on a high-priority path that bypasses the async queue. A slow LLM call can never delay a `STOP` command.
-
-**Fault isolation** — every agent handler is wrapped in `_safe_dispatch()`. An exception in one agent does not crash or stall the others.
-
-**Deterministic fallbacks** — the LLM cascade always terminates in a deterministic response. The system never raises `RuntimeError` due to LLM unavailability.
-
-**Probabilistic confidence over binary thresholds** — memories degrade gracefully through exponential decay rather than hard expiry cliffs. Stale memories produce uncertain guidance, not silence.
-
-**Active perception** — agents request better sensory data rather than degrading passively. Low-confidence memory retrieval triggers a camera pan signal to improve the observation.
-
-### Optional hybrid focused vision
-
-Continuous scene awareness remains on lightweight YOLO. A user-requested
-open-vocabulary target can additionally use Grounding DINO, optional SAM2 box
-refinement, and multi-frame tracking. Install the optional stack with:
-
-```bash
-pip install -r requirements-hybrid-vision.txt
+```env
+CAMERA_MODE=ip
+CAMERA_IP_URL=http://192.168.x.x:8080/video
 ```
 
-The models load lazily on the first focused request. Configure them with
-`HYBRID_VISION_ENABLED`, `GROUNDING_DINO_MODEL`, and `SAM2_MODEL`. If either
-backend cannot load, Lumina logs the reason; Grounding DINO failure falls back
-to the existing YOLO-World focused scan, while SAM2 failure retains the
-Grounding DINO box and temporal tracker.
+This allows the backend to run on a laptop or workstation while the phone acts as the visual sensor.
+
+---
+
+# Repository structure
+
+```text
+DrishtiSense/
+│
+├── main.py
+│   └── FastAPI app, runtime configuration, REST/WebSocket APIs
+│
+├── orchestrator.py
+│   └── Component wiring and perception-loop bootstrap
+│
+├── agents.py
+│   └── Spatial-memory and navigation agents
+│
+├── event_bus.py
+│   └── Async Pub/Sub event infrastructure
+│
+├── vision.py
+│   ├── object detection
+│   ├── tracking
+│   ├── depth estimation
+│   ├── Re-ID
+│   ├── occupancy mapping
+│   └── visual odometry
+│
+├── models.py
+│   └── Spatial data models and geometry utilities
+│
+└── .env.example
+    └── Runtime configuration template
+```
+
+---
+
+# Design principles
+
+## Geometry before language
+
+Distance, direction, heading, object position, and arrival should come from deterministic spatial computation.
+
+The LLM communicates those values. It does not invent them.
+
+## Safety before reasoning
+
+Immediate hazard handling belongs in the low-latency perception path.
+
+```text
+Safety Loop > LLM Loop
+```
+
+## Memory should express uncertainty
+
+A five-second-old observation and a two-hour-old observation should not be presented with the same certainty.
+
+## Navigation should produce actions
+
+Avoid:
+
+```text
+azimuth=-21.6
+translation_z=1.43
+confidence=0.72
+```
+
+Prefer:
+
+> **“Move slightly left. The target is approximately 1.4 metres ahead.”**
+
+## Agents should have a reason to exist
+
+Agents own independent responsibilities such as memory creation, deduplication, retrieval, route generation, route validation, and obstacle avoidance.
+
+---
+
+# Project status
+
+> [!IMPORTANT]
+> **DrishtiSense is an experimental assistive spatial-intelligence prototype.**
+
+It is intended for research, experimentation, accessibility prototyping, hackathons, and spatial-AI development.
+
+It is **not currently a replacement** for mobility canes, guide dogs, trained orientation-and-mobility assistance, or certified assistive navigation devices.
+
+Object detection, monocular depth, tracking, remembered positions, and navigation guidance can be incorrect.
+
+Real-world deployment requires extensive accessibility testing, sensor redundancy, hardware validation, fail-safe behavior, and evaluation with the people the system is intended to support.
+
+---
+
+# Roadmap
+
+- [ ] Metric Visual-Inertial Odometry
+- [ ] ARCore / ARKit world anchoring
+- [ ] Persistent room-scale mapping
+- [ ] Cross-room spatial memory
+- [ ] Semantic room understanding
+- [ ] Free-space semantic segmentation
+- [ ] Dynamic obstacle trajectory prediction
+- [ ] Haptic guidance
+- [ ] Smart-glasses integration
+- [ ] Fully on-device inference
+- [ ] Outdoor navigation
+- [ ] Accessibility-focused user studies
+- [ ] Benchmarking for distance and navigation accuracy
+
+---
+
+# Research direction
+
+Most computer-vision systems answer:
+
+> **What is visible?**
+
+DrishtiSense is exploring a broader problem:
+
+> **What is around the user, what has changed, what should be remembered, and what action should happen next?**
+
+That is the transition from object detection toward **persistent spatial intelligence**.
+
+---
+
+# Contributing
+
+Contributions are welcome.
+
+Areas where open-source collaboration can create meaningful improvements include:
+
+- computer vision,
+- SLAM / VIO,
+- accessibility,
+- robotics,
+- depth estimation,
+- object Re-ID,
+- multimodal AI,
+- spatial computing,
+- edge inference,
+- navigation,
+- multi-agent systems.
+
+For major architectural changes, please open an issue first so the problem, safety implications, and implementation direction can be discussed before development.
+
+---
+
+# Responsible use
+
+DrishtiSense works in a safety-sensitive domain.
+
+Changes that affect navigation, obstacle avoidance, distance estimation, emergency warnings, or route generation should include a clear explanation of failure modes and testing assumptions.
+
+Do not treat model confidence as physical certainty.
+
+---
+
+# Acknowledgements
+
+DrishtiSense builds on the open-source AI and computer-vision ecosystem, including:
+
+- Ultralytics
+- OpenCV
+- MiDaS
+- Qdrant
+- Grounding DINO
+- SAM2
+- FastAPI
+- Sentence Transformers
+- llama.cpp
+- Ollama
+
+---
+
+<p align="center">
+  <strong>Perceive the world. Remember the space. Navigate with confidence.</strong>
+</p>
+
+<p align="center">
+  <sub>Built to explore how spatial AI can make environmental understanding more useful, continuous, and accessible.</sub>
+</p>
