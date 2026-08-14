@@ -1,4 +1,3 @@
-[DrishtiSense_README.md](https://github.com/user-attachments/files/31081919/DrishtiSense_README.md)
 # DrishtiSense
 
 <p align="center">
