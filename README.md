@@ -19,11 +19,13 @@
     <img src="https://img.shields.io/github/last-commit/Abhiiishek44/DrishtiSense?style=flat-square" alt="Last Commit">
   </a>
 </p>
-DrishtiSense is an assistive spatial intelligence system that builds a persistent understanding of the surrounding environment from a live camera feed.
 
-By combining real-time vision, depth estimation, visual odometry, spatial memory, and obstacle-aware navigation, it can track objects beyond the current frame, reason about their relative position, and provide context-aware guidance as the user moves.
+**DrishtiSense** is an assistive spatial intelligence system that maintains a persistent understanding of the surrounding environment from a live camera feed.
 
-Perception that persists beyond the camera frame.
+By combining real-time vision, depth estimation, visual odometry, spatial memory, and obstacle-aware navigation, DrishtiSense can track objects beyond the current frame, reason about their relative position, and provide context-aware guidance as the user moves.
+
+> **Perception that persists beyond the camera frame.**
+
 ---
 
 ## Core Capabilities
@@ -46,8 +48,14 @@ Perception that persists beyond the camera frame.
 ---
 
 ## Architecture
-      
-```
+
+<p align="center">
+  <img
+    src="assets/drishtisense-architecture.png"
+    alt="DrishtiSense Architecture"
+    width="760"
+  />
+</p>
 
 DrishtiSense separates latency-sensitive perception from slower memory and reasoning tasks.
 
@@ -306,7 +314,7 @@ CAMERA_IP_URL=http://<phone-ip>:8080/video
 
 ---
 
-## Current Scope
+## Project Scope
 
 DrishtiSense currently focuses on:
 
