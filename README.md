@@ -58,34 +58,7 @@ By combining real-time vision, depth estimation, visual odometry, spatial memory
 </p>
 DrishtiSense separates latency-sensitive perception from slower memory and reasoning tasks.
 
-### Perception Loop
-
-```text
-camera frame
-→ visual odometry
-→ object detection
-→ object tracking
-→ depth estimation
-→ 3D projection
-→ occupancy update
-→ safety checks
-```
-
 This path does not depend on LLM latency.
-
-### Agent Layer
-
-Runtime coordination is handled through an asynchronous Pub/Sub event bus.
-
-```text
-vision/new_frame
-      ↓
-ArchivistAgent
-      ↓
-JanitorAgent
-      ↓
-Spatial Memory
-```
 
 User queries follow:
 
