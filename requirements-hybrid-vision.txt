@@ -1,0 +1,8 @@
+# Optional focused-search stack. Lumina continues with YOLO-World when these
+# packages or their model weights are unavailable.
+torch>=2.2
+torchvision>=0.17
+transformers>=4.46
+accelerate>=0.30
+pillow>=10.0
+ultralytics>=8.3

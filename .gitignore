@@ -1,0 +1,38 @@
+# Runtime spatial memory
+lumina_world_memory.json
+lumina_world_memory.json.tmp
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python build and test artefacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs and local model weights (download or configure these locally)
+*.log
+weights/
+*.pt
+*.onnx

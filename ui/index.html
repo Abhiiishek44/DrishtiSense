@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090c0e">
+  <title>Lumina · Spatial guidance</title>
+  <link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Lumina home">
+        <span class="brand-mark" aria-hidden="true"><i></i></span>
+        <span><strong>LUMINA</strong><small>Spatial guidance</small></span>
+      </a>
+      <div class="system-state">
+        <span id="modeBadge" class="mode-badge">EXPLORE</span>
+        <span id="connection" class="connection"><i></i><span>Connecting</span></span>
+      </div>
+    </header>
+
+    <section class="primary-layout">
+      <section class="world-view" aria-labelledby="worldTitle">
+        <header class="section-head">
+          <div><span class="kicker">LIVE WORLD VIEW</span><h1 id="worldTitle">Your surroundings</h1></div>
+          <span id="cameraState" class="quiet-status">Starting camera</span>
+        </header>
+        <div class="camera-stage">
+          <img id="camera" src="/camera.jpg" alt="Live view of the space ahead">
+          <canvas id="overlay" aria-hidden="true"></canvas>
+          <div id="guidanceHud" class="guidance guidance--waiting" role="status" aria-live="assertive">
+            <span id="guidanceIcon" class="guidance-icon">•</span>
+            <div><strong id="guidanceMain">ASSESSING SURROUNDINGS</strong><small id="guidanceDetail">Hold the camera steady</small></div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="goal-rail" aria-labelledby="goalHeading">
+        <section id="goalPanel" class="goal-panel goal--idle">
+          <span class="kicker">CURRENT GOAL</span>
+          <div class="goal-state" id="goalState">IDLE</div>
+          <h2 id="goalHeading">Ready when you are</h2>
+          <p id="goalDistance" class="goal-distance">Ask Lumina to find or guide you to an object.</p>
+          <dl id="goalFacts" class="goal-facts"></dl>
+          <button id="cancelGoal" class="text-button" type="button" hidden>Cancel guidance</button>
+        </section>
+        <section class="nearby" aria-labelledby="nearbyHeading">
+          <div class="subhead"><h2 id="nearbyHeading">What matters now</h2><button id="viewAll" class="text-button" type="button" hidden>View all</button></div>
+          <div id="nearbyObjects" class="nearby-list"><p class="empty">Waiting for vision.</p></div>
+        </section>
+      </aside>
+    </section>
+
+    <section class="support-layout">
+      <section class="voice-panel" aria-labelledby="voiceHeading">
+        <div class="voice-control">
+          <button id="voiceButton" class="mic-button" type="button" aria-label="Ask Lumina by voice">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V6a3.5 3.5 0 1 0-7 0v6a3.5 3.5 0 0 0 3.5 3.5Zm-7-4a7 7 0 0 0 14 0M12 18.5V22M8.5 22h7"/></svg>
+          </button>
+          <div id="waveform" class="waveform" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        </div>
+        <div class="conversation">
+          <span class="kicker" id="voiceHeading">ASK LUMINA</span>
+          <p id="voiceState" class="voice-state">Tap the microphone and speak naturally.</p>
+          <p id="userUtterance" class="user-utterance">“Take me to my bottle.”</p>
+          <div id="assistantResponse" class="assistant-response" role="status" aria-live="polite">I’m ready to help you move through your space.</div>
+          <form id="queryForm" class="text-query">
+            <input id="query" type="text" placeholder="Or type a request" autocomplete="off" aria-label="Type a request for Lumina">
+            <button type="submit">Send</button>
+          </form>
+          <details class="find-tools">
+            <summary>Focused object scan</summary>
+            <div class="scan-row"><input id="targets" placeholder="Object name, for example keys"><button id="targetButton" type="button">Scan</button><button id="homeScanButton" type="button">Scan room</button></div>
+          </details>
+        </div>
+      </section>
+
+      <details class="radar-panel" open>
+        <summary><span><span class="kicker">SPATIAL RADAR</span><strong>World memory</strong></span><small>Visible + remembered</small></summary>
+        <div class="radar-body">
+          <svg id="spatialRadar" class="radar" viewBox="0 0 360 230" role="img" aria-label="Objects positioned around you"></svg>
+          <div id="memoryList" class="memory-list"><p class="empty">No useful memories yet.</p></div>
+        </div>
+      </details>
+    </section>
+
+    <aside id="focusedResult" class="focused-result" aria-live="polite" hidden>
+      <button id="dismissFocused" type="button" aria-label="Dismiss focused scan">×</button>
+      <span class="kicker">FOCUSED SCAN</span><div id="focusedContent">Searching…</div>
+    </aside>
+
+    <details class="developer-mode">
+      <summary>Developer Mode</summary>
+      <pre id="diagnostics">No events received.</pre>
+    </details>
+  </main>
+  <script src="/ui/app.js" defer></script>
+</body>
+</html>
