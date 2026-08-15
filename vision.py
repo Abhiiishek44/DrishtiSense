@@ -1,5 +1,5 @@
 """
-Lumina v4.1 — Vision Module
+DrishtiSense v4.1 — Vision Module
 
 Root-cause fixes for four architectural vulnerabilities:
 
@@ -50,6 +50,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -84,7 +85,7 @@ class HybridTargetDetector:
 
     Grounding DINO is invoked only for an initial query or reacquisition.
     SAM2 refines its box when available. Between those expensive calls a
-    template tracker emits candidates into Lumina's existing IoU tracker,
+    template tracker emits candidates into DrishtiSense's existing IoU tracker,
     which supplies the required multi-frame verification.
     """
 
@@ -121,6 +122,14 @@ class HybridTargetDetector:
         self._last_seen = 0.0
         self._last_search = 0.0
         self._misses = 0
+        self._face_cascade = None
+        self._eyeglasses_cascade = None
+        self._cascade_load_attempted = False
+        self._eyeglasses_clip = None
+        self._eyeglasses_clip_preprocess = None
+        self._eyeglasses_clip_text = None
+        self._clip_load_attempted = False
+        self._clip_lock = threading.Lock()
 
     @property
     def available(self) -> bool:
@@ -164,8 +173,6 @@ class HybridTargetDetector:
                scene_detections: Optional[List[Detection]] = None) -> List[Detection]:
         """Run semantic detection once, refine, and initialize target lock."""
         self._last_search = time.monotonic()
-        if not self._ensure_loaded():
-            return []
         canonical = YOLODetector._canonical_target(target)
         with self._state_lock:
             if not self._target:
@@ -173,6 +180,19 @@ class HybridTargetDetector:
             elif self._target != canonical:
                 log.info("Discarding superseded focused result for '%s'", canonical)
                 return []
+
+        # Worn eyeglasses are too small for general object detectors and are
+        # not a COCO class. Run a lightweight offline face/eye cascade first;
+        # it is purpose-built for this case and does not need model downloads.
+        if canonical == "eyeglasses":
+            local = self._detect_worn_eyeglasses(frame, scene_detections or [])
+            if local:
+                best = max(local, key=lambda item: item.confidence)
+                self._lock(frame, canonical, best)
+                return [best]
+
+        if not self._ensure_loaded():
+            return []
         prompts = list(self._VARIANTS.get(canonical, (canonical,)))
         scans = [(frame, 0, 0)]
         # A face/head crop gives thin eyewear substantially more pixels while
@@ -352,6 +372,175 @@ class HybridTargetDetector:
             if x2 - x1 >= 32 and y2 - y1 >= 32:
                 rois.append((frame[y1:y2, x1:x2], x1, y1))
         return rois
+
+    def _load_eyeglasses_cascades(self) -> bool:
+        if self._cascade_load_attempted:
+            return bool(self._face_cascade is not None and self._eyeglasses_cascade is not None)
+        self._cascade_load_attempted = True
+        cascade_dir = Path(__file__).resolve().parent / "weights" / "haarcascades"
+        face = cv2.CascadeClassifier(str(cascade_dir / "haarcascade_frontalface_default.xml"))
+        eyes = cv2.CascadeClassifier(str(cascade_dir / "haarcascade_eye_tree_eyeglasses.xml"))
+        if face.empty() or eyes.empty():
+            log.warning("Offline eyeglasses cascades are unavailable in %s", cascade_dir)
+            return False
+        self._face_cascade = face
+        self._eyeglasses_cascade = eyes
+        return True
+
+    def _detect_worn_eyeglasses(self, frame: np.ndarray,
+                                 scene_detections: List[Detection]) -> List[Detection]:
+        """Detect a horizontally aligned eye pair inside a face/head region."""
+        if not self._load_eyeglasses_cascades():
+            return []
+        height, width = frame.shape[:2]
+        scans = [(frame, 0, 0)] + self._person_head_rois(frame, scene_detections)
+        candidates: List[Detection] = []
+        for scan, scan_x, scan_y in scans:
+            if scan.size == 0:
+                continue
+            gray = cv2.equalizeHist(cv2.cvtColor(scan, cv2.COLOR_BGR2GRAY))
+            sh, sw = gray.shape
+            min_face = max(40, int(min(sw, sh) * 0.18))
+            faces = self._face_cascade.detectMultiScale(
+                gray, scaleFactor=1.08, minNeighbors=4,
+                minSize=(min_face, min_face),
+            )
+            regions = [
+                (gray[y:y + h, x:x + w], scan_x + x, scan_y + y, w, h)
+                for x, y, w, h in faces
+            ]
+            # A close face can fill the person-head crop and evade the face
+            # cascade. In that case, pair eye-glasses detections in the crop.
+            if not regions and (scan_x or scan_y):
+                regions = [(gray, scan_x, scan_y, sw, sh)]
+            for region, offset_x, offset_y, region_w, region_h in regions:
+                # Glasses sit in the upper two-thirds of a face.
+                eye_band = region[:max(1, int(region_h * 0.68)), :]
+                min_eye = max(8, int(min(region_w, region_h) * 0.09))
+                eyes = self._eyeglasses_cascade.detectMultiScale(
+                    eye_band, scaleFactor=1.05, minNeighbors=3,
+                    minSize=(min_eye, max(6, int(min_eye * 0.65))),
+                )
+                pair = self._best_eyeglasses_pair(eyes, region_w, region_h)
+                if pair is None:
+                    continue
+                semantic_confidence = self._wearing_eyeglasses_confidence(region)
+                # The Haar cascade finds eye structure, not glasses frames by
+                # itself. Require a semantic face-crop confirmation so people
+                # with bare eyes are not mislabeled as wearing glasses.
+                if semantic_confidence is None or semantic_confidence < 0.58:
+                    continue
+                x1, y1, x2, y2, geometry_confidence = pair
+                confidence = round(0.45 * geometry_confidence +
+                                   0.55 * semantic_confidence, 3)
+                pad_x, pad_y = region_w * 0.04, region_h * 0.035
+                box = BoundingBox(
+                    x1=max(0.0, offset_x + x1 - pad_x),
+                    y1=max(0.0, offset_y + y1 - pad_y),
+                    x2=min(float(width), offset_x + x2 + pad_x),
+                    y2=min(float(height), offset_y + y2 + pad_y),
+                )
+                candidates.append(Detection(
+                    label="eyeglasses", confidence=confidence, bbox=box,
+                    frame_width=width, frame_height=height,
+                    source="opencv-eyeglasses",
+                ))
+        return YOLODetector._deduplicate(candidates)
+
+    def _load_eyeglasses_clip(self) -> bool:
+        if self._eyeglasses_clip is not None:
+            return True
+        with self._clip_lock:
+            if self._eyeglasses_clip is not None:
+                return True
+            if self._clip_load_attempted:
+                return False
+            self._clip_load_attempted = True
+            model_path = Path(__file__).resolve().parent / "weights" / "clip" / "ViT-B-32.pt"
+            if not model_path.exists():
+                log.warning("Eyeglasses CLIP weights are unavailable: %s", model_path)
+                return False
+            try:
+                import clip
+                import torch
+                model, preprocess = clip.load(str(model_path), device="cpu")
+                positive = [
+                    "a person wearing glasses", "a person with eyeglasses",
+                    "eyeglasses on a face", "a face with glasses frames",
+                    "spectacles on a person",
+                ]
+                negative = [
+                    "a person not wearing glasses", "a person without eyeglasses",
+                    "a face with bare eyes", "a face without glasses frames",
+                    "a person with no spectacles",
+                ]
+                with torch.inference_mode():
+                    features = model.encode_text(clip.tokenize(positive + negative))
+                    features = features / features.norm(dim=-1, keepdim=True)
+                    pos = features[:len(positive)].mean(dim=0)
+                    neg = features[len(positive):].mean(dim=0)
+                    text_features = torch.stack([pos / pos.norm(), neg / neg.norm()])
+                self._eyeglasses_clip = model.eval()
+                self._eyeglasses_clip_preprocess = preprocess
+                self._eyeglasses_clip_text = text_features
+                return True
+            except Exception as exc:
+                log.warning("Eyeglasses CLIP confirmation unavailable: %s", exc)
+                return False
+
+    def warm_eyeglasses_detector(self) -> bool:
+        """Load the offline wearable detector before the first voice query."""
+        return self._load_eyeglasses_cascades() and self._load_eyeglasses_clip()
+
+    def _wearing_eyeglasses_confidence(self, face_bgr: np.ndarray) -> Optional[float]:
+        if face_bgr.size == 0 or not self._load_eyeglasses_clip():
+            return None
+        try:
+            import torch
+            from PIL import Image
+            face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+            image = self._eyeglasses_clip_preprocess(Image.fromarray(face_rgb)).unsqueeze(0)
+            with self._clip_lock, torch.inference_mode():
+                feature = self._eyeglasses_clip.encode_image(image)
+                feature = feature / feature.norm(dim=-1, keepdim=True)
+                probability = (100.0 * feature @ self._eyeglasses_clip_text.T).softmax(dim=-1)[0, 0]
+            return float(probability)
+        except Exception as exc:
+            log.warning("Eyeglasses CLIP confirmation failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _best_eyeglasses_pair(eyes, region_w: int, region_h: int):
+        """Choose two eye detections with plausible glasses-frame geometry."""
+        best = None
+        for index, left in enumerate(eyes):
+            first = tuple(float(value) for value in left)
+            for right in eyes[index + 1:]:
+                second = tuple(float(value) for value in right)
+                if first[0] + first[2] / 2 <= second[0] + second[2] / 2:
+                    lx, ly, lw, lh = first
+                    rx, ry, rw, rh = second
+                else:
+                    lx, ly, lw, lh = second
+                    rx, ry, rw, rh = first
+                left_cx, left_cy = lx + lw / 2, ly + lh / 2
+                right_cx, right_cy = rx + rw / 2, ry + rh / 2
+                separation = right_cx - left_cx
+                if not (region_w * 0.16 <= separation <= region_w * 0.72):
+                    continue
+                if abs(right_cy - left_cy) > region_h * 0.16:
+                    continue
+                size_ratio = max(lw * lh, rw * rh) / max(1.0, min(lw * lh, rw * rh))
+                if size_ratio > 2.6:
+                    continue
+                alignment = 1.0 - min(1.0, abs(right_cy - left_cy) / max(1.0, region_h * 0.16))
+                symmetry = 1.0 / size_ratio
+                confidence = round(0.58 + 0.12 * alignment + 0.10 * symmetry, 3)
+                candidate = (min(lx, rx), min(ly, ry), max(lx + lw, rx + rw),
+                             max(ly + lh, ry + rh), confidence)
+                if best is None or candidate[-1] > best[-1]:
+                    best = candidate
+        return best
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1457,6 +1646,9 @@ class YOLODetector:
             "picture frame", "photo frame", "framed photograph",
             "framed picture", "wall picture", "wall art",
         ),
+        # Partial chairs (for example, behind a person at the edge of frame)
+        # benefit from shape-specific prompts during the one-shot focused scan.
+        "chair": ("chair", "office chair", "armchair", "seat", "black chair"),
         "photo frame": (
             "picture frame", "photo frame", "framed photograph",
             "framed picture", "wall picture", "wall art",
@@ -1495,7 +1687,8 @@ class YOLODetector:
         "towel", "eyeglasses", "eye glasses", "glasses", "spectacles",
     }
     _CANONICAL_TARGETS = {
-        "photo frame": "picture frame", "wall picture": "picture frame",
+        "photo frame": "picture frame", "photo picture": "picture frame",
+        "wall picture": "picture frame",
         "t shirt": "shirt", "t-shirt": "shirt", "key": "keys", "keychain": "keys",
         "eye glasses": "eyeglasses", "glasses": "eyeglasses", "spectacles": "eyeglasses",
         "reading glasses": "eyeglasses",
@@ -1591,6 +1784,23 @@ class YOLODetector:
     @classmethod
     def _canonical_target(cls, value: str) -> str:
         return cls._CANONICAL_TARGETS.get(value.lower().strip(), value.lower().strip())
+
+    def supports_standard_target(self, target: str) -> bool:
+        """Return whether the lightweight COCO model already knows this label.
+
+        Querying a standard class such as ``bottle`` must not lazy-load the
+        much larger Grounding DINO + SAM cascade. Apart from being redundant,
+        that first-query memory spike can terminate a small edge process and
+        take its WebSocket connection down with it.
+        """
+        if self._coco_model is None:
+            return False
+        names = getattr(self._coco_model, "names", {})
+        labels = names.values() if isinstance(names, dict) else names
+        canonical = self._canonical_target(target)
+        return canonical in {
+            self._canonical_target(str(label)) for label in (labels or [])
+        }
 
     def _open_vocab_prompts(self, classes: List[str]) -> Tuple[List[str], Dict[str, str]]:
         """Expand target wording while retaining a stable label for tracking."""
@@ -1885,6 +2095,20 @@ class DepthFusionEngine:
         cx_px = track.bbox.center_x
         cy_px = track.bbox.center_y
         geometric_z = estimate_distance_geometric(track.label, track.bbox.height, intr.fx)
+        # A close person/chair is commonly cropped by the image boundary. In
+        # that case bbox height is only a body fragment, so treating it as the
+        # object's full known height dangerously overestimates distance. Use
+        # apparent shoulder/object width as a conservative second estimate.
+        approximate_widths = {"person": 0.50, "chair": 0.55}
+        object_width = approximate_widths.get(track.label.lower())
+        frame_h = max(1, int(getattr(track.det, "frame_height", 0) or 0))
+        clipped_vertically = bool(
+            frame_h and (track.bbox.y1 <= frame_h * 0.02 or
+                         track.bbox.y2 >= frame_h * 0.98)
+        )
+        if object_width and clipped_vertically and track.bbox.width >= 8:
+            width_z = object_width * intr.fx / track.bbox.width
+            geometric_z = round(max(0.1, min(geometric_z, width_z)), 2)
 
         # Depth source: RANSAC-calibrated MiDaS metric map, otherwise a
         # physically meaningful pinhole estimate from the object's bbox.
@@ -2141,11 +2365,14 @@ class SafetyCortex:
         # FIX 3: avoidance engine receives the shared occupancy grid
         self._avoider = DynamicAvoidanceEngine(occupancy_grid=occupancy_grid)
 
-    def evaluate(self, tracks: List[Track], current_heading: float) -> List[DangerAlert]:
+    def evaluate(self, tracks: List[Track], current_heading: float,
+                 target_label: Optional[str] = None) -> List[DangerAlert]:
         now = time.time()
         alerts: List[DangerAlert] = []
+        target = str(target_label or "").lower().strip()
         for track in tracks:
             if (track.label not in _WALKING_OBSTACLES or
+                    track.label.lower() == target or
                     track.label in _SURFACE_OBJ or
                     not track.is_confirmed or
                     track.det.confidence < _SAFETY_MIN_CONFIDENCE):
