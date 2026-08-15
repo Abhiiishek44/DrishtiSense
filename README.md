@@ -286,21 +286,6 @@ CAMERA_IP_URL=http://<phone-ip>:8080/video
 
 ---
 
-## Project Scope
-
-DrishtiSense currently focuses on:
-
-- indoor spatial awareness
-- object memory
-- target finding
-- local navigation guidance
-- obstacle awareness
-- voice interaction
-
-> DrishtiSense is an experimental prototype and is not a replacement for certified mobility aids or orientation-and-mobility support.
-
----
-
 ## License
 
 See [`LICENSE`](LICENSE).
