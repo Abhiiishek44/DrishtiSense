@@ -17,6 +17,7 @@ from spatial_memory import CameraPose, PersistentSpatialMemory
 
 _ALIASES = {
     "phone": "cell phone", "mobile": "cell phone", "photo frame": "picture frame",
+    "photo picture": "picture frame",
     "photograph frame": "picture frame", "key": "keys", "keychain": "keys",
     "sofa": "couch", "television": "tv",
     "eye glasses": "eyeglasses", "glasses": "eyeglasses", "spectacles": "eyeglasses",
@@ -98,6 +99,14 @@ class GoalNavigator:
     ANGLE_SMOOTHING = 0.45
     DISTANCE_SMOOTHING = 0.55
     UPDATE_INTERVAL_SECONDS = 0.5
+    # Large/solid targets are destinations and obstacles at the same time.
+    # Complete guidance at a safe stand-off instead of walking the user into
+    # the object to satisfy the generic small-item arrival threshold.
+    TARGET_STANDOFF_M = {
+        "person": 1.2, "chair": 0.9, "bench": 0.9,
+        "couch": 0.9, "bed": 0.9, "dining table": 0.9,
+        "toilet": 0.8, "refrigerator": 0.9,
+    }
 
     def __init__(self, arrival_distance_m: float = DEFAULT_ARRIVAL_DISTANCE_M):
         self._goal: Optional[NavigationGoal] = None
@@ -215,12 +224,23 @@ class GoalNavigator:
         self._goal.smoothed_heading_error = heading_error
         self._goal.smoothed_distance = distance
 
-        if raw_distance <= self._arrival_distance_m and abs(raw_error) <= self.ALIGN_EXIT_DEG:
+        arrival_distance = max(
+            self._arrival_distance_m,
+            self.TARGET_STANDOFF_M.get(str(target.get("object", "")).lower(), 0.0),
+        )
+        if raw_distance <= arrival_distance and abs(raw_error) <= self.ALIGN_EXIT_DEG:
             self._goal.status = "complete"
             self._goal.tracking_state = "arrived"
-            text = f"You are here. Your {self._goal.label} is directly ahead."
+            uses_standoff = arrival_distance > self._arrival_distance_m
+            text = (
+                f"Stop here. Your {self._goal.label} is directly ahead, "
+                f"about {raw_distance:.1f} metres away."
+                if uses_standoff else
+                f"You are here. Your {self._goal.label} is directly ahead."
+            )
             return self._event("complete", self._goal.label, text, target,
-                               "reach", "◎ YOU'RE HERE", distance, heading_error)
+                               "reach", "◎ STOP HERE · TARGET AHEAD" if uses_standoff
+                               else "◎ YOU'RE HERE", distance, heading_error)
 
         abs_error = abs(heading_error)
         was_aligned = self._goal.aligned
