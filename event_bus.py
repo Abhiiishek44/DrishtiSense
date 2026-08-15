@@ -1,5 +1,5 @@
 """
-Lumina v5 — Central Event Bus (Pub/Sub Architecture)
+DrishtiSense v5 — Central Event Bus (Pub/Sub Architecture)
 =====================================================
 
 WHY THIS EXISTS — THE HACKATHON ARGUMENT:
@@ -132,7 +132,7 @@ USER_RESPONSE_TOPICS: Set[str] = {
 
 class EventBus:
     """
-    Async Pub/Sub message broker for the Lumina MAS.
+    Async Pub/Sub message broker for the DrishtiSense MAS.
 
     KEY DESIGN DECISIONS for the judges:
 
@@ -182,6 +182,7 @@ class EventBus:
         self._running = False
         self._dispatcher_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._immediate_tasks: Set[asyncio.Task] = set()
 
         log.info("EventBus initialized — Pub/Sub architecture active")
 
@@ -271,10 +272,12 @@ class EventBus:
             # This is the "software interrupt" model: the safety reflex fires
             # immediately and doesn't block the caller.
             for handler in handlers:
-                asyncio.create_task(
+                task = asyncio.create_task(
                     self._safe_dispatch(handler, event),
                     name=f"immediate_{topic}_{event.event_id[:6]}",
                 )
+                self._immediate_tasks.add(task)
+                task.add_done_callback(self._immediate_tasks.discard)
         else:
             # NORMAL PATH: enqueue for ordered dispatch
             for handler in handlers:
@@ -300,8 +303,8 @@ class EventBus:
         if self._loop is not None and self._loop.is_running():
             for handler in handlers:
                 self._loop.call_soon_threadsafe(
-                    self._loop.create_task,
-                    self._safe_dispatch(handler, event),
+                    self._schedule_immediate,
+                    handler, event,
                 )
         else:
             log.warning(
@@ -336,6 +339,19 @@ class EventBus:
                 await self._dispatcher_task
             except asyncio.CancelledError:
                 pass
+        # Immediate safety/query handlers bypass the queue. Track and drain
+        # them explicitly so a memory-search executor cannot outlive the bus
+        # or hold a WebSocket/event loop open during shutdown.
+        for _ in range(8):
+            pending = [task for task in self._immediate_tasks if not task.done()]
+            if not pending:
+                break
+            done, still_pending = await asyncio.wait(pending, timeout=1.0)
+            if still_pending:
+                for task in still_pending:
+                    task.cancel()
+                await asyncio.gather(*still_pending, return_exceptions=True)
+                break
         log.info("EventBus stopped")
 
     async def _dispatch_loop(self) -> None:
@@ -398,6 +414,15 @@ class EventBus:
                 f"raised on topic {event.topic!r}: {e}",
                 exc_info=True,
             )
+
+    def _schedule_immediate(self, handler: Subscriber, event: Event) -> None:
+        """Create and retain a thread-safe immediate-dispatch task."""
+        task = asyncio.create_task(
+            self._safe_dispatch(handler, event),
+            name=f"immediate_{event.topic}_{event.event_id[:6]}",
+        )
+        self._immediate_tasks.add(task)
+        task.add_done_callback(self._immediate_tasks.discard)
 
     # ──────────────────────────────────────────────────────────────────────
     # INTROSPECTION (for dashboards and debugging)
