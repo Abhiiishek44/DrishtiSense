@@ -1,5 +1,5 @@
 """
-Lumina v5 — Orchestrator (Bootstrap Only)
+DrishtiSense v5 — Orchestrator (Bootstrap Only)
 ==========================================
 
 WHAT THIS FILE IS NOW vs. WHAT IT WAS:
@@ -114,6 +114,10 @@ class LuminaOrchestrator:
     behaviour is driven by agents reacting to events.
     """
 
+    DIRECT_FIND_TIMEOUT_SECONDS = 10.0
+    OPEN_VOCAB_FIND_TIMEOUT_SECONDS = 22.0
+    EYEGLASSES_FIND_TIMEOUT_SECONDS = 15.0
+
     def __init__(self):
         self.session_id = str(uuid.uuid4())[:8]
         self._broadcast: Optional[Broadcaster] = None
@@ -128,6 +132,7 @@ class LuminaOrchestrator:
         self._detector: Optional[YOLODetector] = None
         self._focused_detector: Optional[HybridTargetDetector] = None
         self._focused_search_task: Optional[asyncio.Task] = None
+        self._eyeglasses_warmup_task: Optional[asyncio.Task] = None
         self._compass: Optional[VisualSLAMCompass] = None
         self._tracker: Optional[IoUTracker] = None
         self._depth: Optional[DepthFusionEngine] = None
@@ -201,8 +206,21 @@ class LuminaOrchestrator:
         self._open_vocab_targets = [canonical]
         self._use_open_vocab = True
         if self._focused_detector:
-            self._focused_detector.select_target(canonical)
+            if self._should_use_hybrid_target(canonical):
+                self._focused_detector.select_target(canonical)
+            else:
+                # COCO/YOLO-World already handles objects such as bottles.
+                # Clearing the semantic tracker also prevents the live loop
+                # from scheduling a Grounding DINO reacquisition immediately.
+                self._focused_detector.clear()
         return canonical
+
+    def _should_use_hybrid_target(self, target: str) -> bool:
+        """Reserve the heavyweight semantic cascade for non-COCO labels."""
+        return bool(
+            self._focused_detector and
+            (not self._detector or not self._detector.supports_standard_target(target))
+        )
 
     async def update_camera_pose(self, x: float, y: float, z: float, yaw_deg: float,
                                  source: str = "arcore") -> dict:
@@ -272,24 +290,42 @@ class LuminaOrchestrator:
         # atomic with respect to another direct scan; the live loop continues
         # to use the selected target after this pass completes.
         async with self._detect_once_lock:
-            if targets and self._focused_detector and not is_room_scan:
-            # General YOLO supplies contextual person boxes for useful ROIs;
-            # Grounding DINO remains query-triggered and off the camera loop.
+            if targets and not is_room_scan:
+                # Prefer an exact result already found by the reliable COCO
+                # detector.  Previously that result was discarded and the
+                # request always waited for Grounding DINO/YOLO-World, which
+                # is why a clearly visible bottle could remain "searching".
                 scene_dets = await loop.run_in_executor(None, self._detector.detect, frame)
-                raw_dets = await loop.run_in_executor(
-                    None, self._focused_detector.search, frame, targets[0], scene_dets
-                )
-                if not raw_dets:
-                    log.warning("Hybrid focused search found no '%s'; trying YOLO-World fallback",
-                                targets[0])
+                raw_dets = self._matching_target_detections(scene_dets, targets[0])
+                if not raw_dets and self._should_use_hybrid_target(targets[0]):
+                    # General YOLO also supplies contextual person boxes for
+                    # useful ROIs. Grounding DINO stays query-triggered and
+                    # off the continuous camera loop.
                     raw_dets = await loop.run_in_executor(
-                        None, self._detector.detect_open, frame, targets
+                        None, self._focused_detector.search, frame, targets[0], scene_dets
+                    )
+                if not raw_dets:
+                    log.info("Focused search found no '%s'; trying YOLO-World fallback",
+                             targets[0])
+                    # COCO classes such as ``cell phone`` get one prompt-aware
+                    # full-frame pass here. Running nine 1536px detail crops
+                    # made a successful phone query exceed the response
+                    # deadline and the browser incorrectly blamed the socket.
+                    detailed = not self._detector.supports_standard_target(targets[0])
+                    raw_dets = await loop.run_in_executor(
+                        None, self._detector.detect_open, frame, targets, detailed
                     )
             else:
                 detector_fn = self._detector.detect_open if targets else self._detector.detect
                 args = (frame, targets) if targets else (frame,)
                 raw_dets = await loop.run_in_executor(None, detector_fn, *args)
-            tracks = self._tracker.update(raw_dets)
+            self._tracker.update(raw_dets)
+            # IoUTracker.update() intentionally hides tentative one-frame
+            # tracks.  A user-triggered scan still needs that first matched
+            # box for an immediate find result; persistence/navigation remain
+            # protected by _verified_tracks() below.
+            tracks = [track for track in self._tracker.get_all_active()
+                      if track.frames_since_seen == 0]
             for track in tracks:
                 self._depth.update(track)
             self._update_landmark_pose(tracks)
@@ -333,14 +369,36 @@ class LuminaOrchestrator:
             "clock_direction": to_clock_direction(t.azimuth_deg)[0],
         } for t in result_tracks]
 
-    async def query(self, raw_text: str) -> None:
-        """
-        Accept a user query and publish it to the bus.
+    def _detect_live_frame(self, frame) -> list:
+        """Keep general hazards visible while a focused target is active."""
+        scene_dets = self._detector.detect(frame)
+        if not self._use_open_vocab or not self._open_vocab_targets:
+            return scene_dets
+        # Standard COCO targets (chair, bottle, phone, etc.) are handled in
+        # the always-on scene pass. Their lower-threshold prompt-aware retry
+        # runs once in detect_once(), without replacing person/obstacle boxes.
+        needs_open_vocab = any(
+            not self._detector.supports_standard_target(target)
+            for target in self._open_vocab_targets
+        )
+        if not needs_open_vocab:
+            return scene_dets
+        target_dets = self._detector.detect_open(
+            frame, self._open_vocab_targets, False
+        )
+        return YOLODetector._deduplicate(scene_dets + target_dets)
 
-        v5 change: instead of calling _handle_query() directly,
-        we publish to the bus and let the LibrarianAgent react.
-        The orchestrator is no longer in the query processing path.
-        """
+    @staticmethod
+    def _matching_target_detections(detections: list, target: str) -> list:
+        """Return only exact, canonical detections for a focused request."""
+        canonical = YOLODetector._canonical_target(target)
+        return [
+            detection for detection in detections
+            if YOLODetector._canonical_target(detection.label) == canonical
+        ]
+
+    async def query(self, raw_text: str) -> None:
+        """Answer user queries, keeping visible-object lookup deterministic."""
         log.info(f'Query received: "{raw_text}"')
         lowered = raw_text.lower().strip()
         if re.search(r"\b(cancel|stop|end)\s+(?:navigation|guidance|goal)\b", lowered):
@@ -355,54 +413,107 @@ class LuminaOrchestrator:
             await self._broadcast_goal(self.start_goal(goal_target))
             return
 
-        # A location request starts a short, high-detail live scan before the
-        # Librarian evaluates stored memories.  This is intentionally not a
-        # navigation shortcut: the result still goes through all agents.
         parsed = _deterministic_parse(raw_text)
-        self._select_search_target(parsed["target"])
-        self._pending_query_text = raw_text
-        self._pending_query_target = self._active_target_label
-        self._pending_query_started = time.monotonic()
+        if parsed["intent"] != "find":
+            await self._answer_non_location_query(raw_text, parsed["intent"])
+            return
+
+        # Finding an object is a perception lookup, not a reasoning problem.
+        # If the dashboard is already drawing the requested track, answer from
+        # that exact track immediately. The previous agent-gated route could
+        # display a bottle while leaving the user stuck on "searching".
+        target = self._select_search_target(parsed["target"])
+        self._pending_query_text = ""
+        self._pending_query_target = ""
         self._pending_live_response_sent = False
+        visible = self._find_visible_target_track(target)
+        if visible is not None:
+            self._pending_live_response_sent = True
+            self._update_active_target([visible])
+            await self._complete_visible_find(raw_text, visible)
+            return
+
+        # A remembered answer is also immediately useful and must not wait for
+        # an optional model or LLM service.
+        location = self.find_object(target)
+        if location:
+            await self._broadcast_location_response(raw_text, location)
+            await self._start_navigation_to_memory(target)
+            return
+
+        # Nothing is known yet: run one focused camera scan in the background.
+        # That task always finishes with either a concrete location or an
+        # explicit not-found response, so the UI cannot search forever.
+        self._pending_query_text = raw_text
+        self._pending_query_target = target
+        self._pending_query_started = time.monotonic()
         if self._broadcast:
             await self._broadcast({
                 "type": "search_status", "status": "searching",
-                "target": self._active_target_label,
-                "text": f"Searching the live camera for {self._active_target_label}…",
+                "target": target,
+                "text": f"Searching the live camera for {target}…",
             })
-        # Model loading and semantic inference can take seconds on CPU or on
-        # the first model download. Never block WebSocket query handling or
-        # delay a memory response while that work runs.
         self._focused_search_task = asyncio.create_task(
-            self._refresh_requested_target(self._active_target_label),
-            name=f"focused_search_{self._active_target_label}",
+            self._complete_direct_find(raw_text, target),
+            name=f"direct_find_{target}",
         )
 
-        log.info(f'Query published to cognitive bus: "{raw_text}"')
-        if self._librarian:
-            query_started = time.monotonic()
-            await event_bus.publish(
-                "system/query_received", QueryPayload(raw_text=raw_text), publisher="SYSTEM",
+    def _find_visible_target_track(self, target: str):
+        canonical = YOLODetector._canonical_target(target)
+        matches = [
+            track for track in self._visible_tracks()
+            if YOLODetector._canonical_target(track.label) == canonical
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda track: (
+            float(getattr(getattr(track, "det", None), "confidence", 0.0)),
+            int(getattr(track, "hits", 0)),
+        ))
+
+    async def _complete_direct_find(self, raw_text: str, target: str) -> None:
+        """Complete one missing-object scan with a guaranteed final answer."""
+        try:
+            timeout = (
+                self.EYEGLASSES_FIND_TIMEOUT_SECONDS if target == "eyeglasses" else
+                self.DIRECT_FIND_TIMEOUT_SECONDS if (
+                    not getattr(self, "_detector", None) or
+                    self._detector.supports_standard_target(target)
+                ) else self.OPEN_VOCAB_FIND_TIMEOUT_SECONDS
             )
-            asyncio.create_task(
-                self._ensure_query_response(raw_text, self._active_target_label, query_started),
-                name="query_response_watchdog",
+            await asyncio.wait_for(
+                self.detect_once([target]), timeout=timeout
             )
+        except asyncio.TimeoutError:
+            log.warning("Direct search for '%s' timed out", target)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Direct search for '%s' failed: %s", target, exc)
+
+        # Ignore a superseded query rather than overwriting its newer answer.
+        if self._pending_query_text != raw_text or self._pending_query_target != target:
+            return
+        visible = self._find_visible_target_track(target)
+        if visible is not None:
+            self._pending_live_response_sent = True
+            self._update_active_target([visible])
+            await self._complete_visible_find(raw_text, visible)
         else:
-            # Qdrant failure previously created a dead letter and left the UI
-            # forever on "Understanding…". Persistent world memory is the
-            # degraded-but-honest response path until the DB is restored.
-            location = self.find_object(self._active_target_label)
+            location = self.find_object(target)
             if location:
                 await self._broadcast_location_response(raw_text, location)
+                await self._start_navigation_to_memory(target)
             elif self._broadcast:
                 await self._broadcast({
                     "type": "response",
-                    "text": (f"I can't see the {self._active_target_label} yet. "
-                             "Keep it in view while I continue searching."),
-                    "target": raw_text, "confidence": 0.0,
-                    "critic_approved": False,
+                    "text": (f"I can't see the {target}, and I don't have a remembered "
+                             "location for it."),
+                    "target": raw_text, "object": target,
+                    "confidence": 0.0, "critic_approved": False,
                 })
+        self._pending_query_text = ""
+        self._pending_query_target = ""
 
     async def _refresh_requested_target(self, label: str) -> None:
         """Try a fresh high-detail open-vocabulary scan before using memory.
@@ -420,10 +531,50 @@ class LuminaOrchestrator:
             return
         try:
             await self.detect_once([label])
+            visible = self._find_visible_target_track(label)
+            if visible is not None:
+                self._promote_requested_track(visible)
         except Exception as exc:
             # Memory and the cognitive route remain available even when an
             # optional focused scan cannot run.
             log.warning("Focused discovery for '%s' failed: %s", label, exc)
+
+    async def _answer_non_location_query(self, raw_text: str, intent: str) -> None:
+        """Answer supported spatial questions without starting object search."""
+        self._pending_query_text = ""
+        self._pending_query_target = ""
+        self._pending_live_response_sent = False
+        if self._goal_navigator.snapshot().get("status") not in {"active", "blocked"}:
+            self._active_target_label = ""
+            self._active_target = None
+            self._open_vocab_targets = []
+            self._use_open_vocab = False
+            if self._focused_detector:
+                self._focused_detector.clear()
+
+        if intent == "inventory":
+            scene = self._world_model.get_scene_summary() if self._world_model else {}
+            labels = []
+            for item in scene.get("active_objects", []):
+                label = item.get("label", "").strip()
+                if label and item.get("state") != "lost" and label not in labels:
+                    labels.append(label)
+            if labels:
+                if len(labels) == 1:
+                    text = f"I can currently see {labels[0]}."
+                else:
+                    text = f"I can currently see {', '.join(labels[:-1])}, and {labels[-1]}."
+            else:
+                text = "I don't have any reliable objects in view yet. Hold the camera steady for a moment."
+        else:
+            text = ("I can find objects, describe what is visible, and guide you through the room. "
+                    "Try asking, ‘Where is my bottle?’")
+
+        if self._broadcast:
+            await self._broadcast({
+                "type": "response", "text": text, "target": raw_text,
+                "confidence": 1.0, "critic_approved": True,
+            })
 
     # ──────────────────────────────────────────────────────────────────────
     # LIFECYCLE
@@ -450,10 +601,14 @@ class LuminaOrchestrator:
         await event_bus.start()
 
         self._running = True
+        if self._focused_detector:
+            self._eyeglasses_warmup_task = asyncio.create_task(
+                self._warm_eyeglasses_detector(), name="eyeglasses_detector_warmup"
+            )
         await self._emit_system_status()
 
         log.info(
-            f"Lumina v5 started — session:{self.session_id} | "
+            f"DrishtiSense v5 started — session:{self.session_id} | "
             f"EventBus active | "
             f"Agents: ARCHIVIST JANITOR LIBRARIAN COORDINATOR CRITIC AVOIDER | "
             f"Fast loop: 30 FPS | Slow loop: async LLM"
@@ -475,7 +630,17 @@ class LuminaOrchestrator:
         await event_bus.stop()
         if self._camera:
             self._camera.release()
-        log.info("Lumina v5 stopped")
+        log.info("DrishtiSense v5 stopped")
+
+    async def _warm_eyeglasses_detector(self) -> None:
+        """Preload local eyeglasses classification without delaying startup."""
+        try:
+            available = await asyncio.get_running_loop().run_in_executor(
+                None, self._focused_detector.warm_eyeglasses_detector
+            )
+            log.info("Offline worn-eyeglasses detector ready: %s", available)
+        except Exception as exc:
+            log.warning("Eyeglasses detector warmup failed: %s", exc)
 
     # ──────────────────────────────────────────────────────────────────────
     # COMPONENT INITIALISATION
@@ -486,7 +651,7 @@ class LuminaOrchestrator:
         Construct all hardware and cognitive components.
         This is identical to v4.1 — the vision stack is unchanged.
         """
-        log.info("Initialising Lumina v5 components…")
+        log.info("Initialising DrishtiSense v5 components…")
 
         self._camera = CameraManager(
             index=settings.CAMERA_INDEX,
@@ -803,24 +968,15 @@ class LuminaOrchestrator:
                 raw_dets = []
                 if self._detector:
                     try:
-                        detector_fn = (
-                            self._detector.detect_open
-                            if self._use_open_vocab else self._detector.detect
-                        )
-                        # A user request gets one detailed crop scan through
-                        # detect_once(). The live follow-up pass keeps the
-                        # target highlighted without repeating those costly
-                        # crops on every frame.
-                        detector_args = ((frame, self._open_vocab_targets, False)
-                                         if self._use_open_vocab else (frame,))
                         raw_dets = await asyncio.get_running_loop().run_in_executor(
-                            None, detector_fn, *detector_args
+                            None, self._detect_live_frame, frame
                         )
                         # Once Grounding DINO/SAM2 has locked the requested
                         # target, cheap frame tracking supplements continuous
                         # YOLO. Semantic re-detection is scheduled only after
                         # confidence loss and never blocks camera rendering.
-                        if self._focused_detector and self._active_target_label:
+                        if (self._focused_detector and self._active_target_label and
+                                self._should_use_hybrid_target(self._active_target_label)):
                             focused_tracks = await asyncio.get_running_loop().run_in_executor(
                                 None, self._focused_detector.track, frame
                             )
@@ -880,6 +1036,7 @@ class LuminaOrchestrator:
                             {
                                 "label": t.label,
                                 "confidence": t.det.confidence,
+                                "source": getattr(t.det, "source", "yolo"),
                                 "track_id": t.id,
                                 "state": t.state,
                                 "distance_m": t.smoothed_distance,
@@ -947,7 +1104,10 @@ class LuminaOrchestrator:
             # when tracks are stale — it uses the last known track state.
             # This is what enables sub-33ms emergency stop response.
             active_tracks = tracks or list(self._tracker.tracks.values())
-            danger_alerts = self._safety.evaluate(active_tracks, pose_heading)
+            danger_alerts = self._safety.evaluate(
+                active_tracks, pose_heading,
+                self._goal_navigator.active_label or self._active_target_label,
+            )
 
             for alert in danger_alerts:
                 if alert.distance_m <= 1.0:
@@ -1049,23 +1209,6 @@ class LuminaOrchestrator:
         """
         from event_bus import RouteFinalPayload
         payload: RouteFinalPayload = event.payload
-        # Memory can answer "not found" before the focused model has examined
-        # the current frame. Do not replace an active live search with that
-        # stale failure; the watchdog will publish the final live/memory reply.
-        waiting_for_live_scan = (
-            payload.query_text == self._pending_query_text and
-            self._focused_search_task is not None and
-            not self._focused_search_task.done() and
-            not (payload.verdict and payload.verdict.approved)
-        )
-        if waiting_for_live_scan:
-            if self._broadcast:
-                await self._broadcast({
-                    "type": "search_status", "status": "searching",
-                    "target": self._pending_query_target,
-                    "text": f"Still scanning the live camera for {self._pending_query_target}…",
-                })
-            return
         self._last_response_query = payload.query_text
         self._last_response_at = time.monotonic()
         if not self._broadcast:
@@ -1108,69 +1251,6 @@ class LuminaOrchestrator:
             "avoidance": avoidance_dict,
         })
 
-    async def _ensure_query_response(self, raw_text: str, target: str,
-                                     query_started: float) -> None:
-        """Guarantee every user query receives a bounded deterministic reply."""
-        await asyncio.sleep(4.0)
-        if (self._last_response_query == raw_text and
-                self._last_response_at >= query_started):
-            return
-        # Loading Grounding DINO or scanning the high-resolution YOLO-World
-        # tiles legitimately takes longer than the cognitive memory lookup.
-        # Keep the request alive instead of telling the user nothing was found
-        # while the camera search is still in progress.
-        live_state = self._active_target
-        has_live_sighting = bool(
-            live_state and live_state.get("label", "").lower() == target.lower() and
-            time.time() - live_state.get("lastSeen", 0) <= 3.0
-        )
-        if (not has_live_sighting and self._focused_search_task is not None and
-                not self._focused_search_task.done() and
-                time.monotonic() - query_started < 45.0):
-            if self._broadcast:
-                await self._broadcast({
-                    "type": "search_status", "status": "searching", "target": target,
-                    "text": f"Still scanning the live camera for {target}…",
-                })
-            asyncio.create_task(
-                self._ensure_query_response(raw_text, target, query_started),
-                name="query_response_watchdog",
-            )
-            return
-        log.warning("Agent response timeout for '%s'; using deterministic fallback", raw_text)
-        state = self._active_target
-        if (state and state["label"].lower() == target.lower() and
-                time.time() - state["lastSeen"] <= 3.0):
-            if self._broadcast:
-                stable = state.get("consecutiveFrames", 0) >= self._target_min_frames
-                lead = (f"{state['direction']}. Your {state['label']} is about "
-                        if stable else f"I can see what looks like your {state['label']}. It is ")
-                suffix = "" if stable else " Keep the camera steady for confirmation."
-                await self._broadcast({
-                    "type": "response",
-                    "text": f"{lead}{state['distance']:.1f} metres away.{suffix}",
-                    "target": raw_text, "object": state["label"],
-                    "confidence": state["confidence"],
-                    "navigation": {
-                        "distance_m": state["distance"],
-                        "angle_relative": state["relativeAngle"],
-                        "direction": state["direction"], "visible": True,
-                    },
-                    "critic_approved": True, "active_target": state,
-                })
-            return
-        location = self.find_object(target)
-        if location:
-            await self._broadcast_location_response(raw_text, location)
-        elif self._broadcast:
-            await self._broadcast({
-                "type": "response",
-                "text": (f"I can't see the {target} now, and I don't have a reliable "
-                         "recent location for it. Move the camera slowly and try again."),
-                "target": raw_text, "object": target,
-                "confidence": 0.0, "critic_approved": False,
-            })
-
     def _verified_tracks(self, tracks: list) -> list:
         """The only detector outputs allowed into memory, radar, or agents."""
         verified = []
@@ -1192,8 +1272,11 @@ class LuminaOrchestrator:
     def _update_active_target(self, tracks: list) -> None:
         if not self._active_target_label:
             return
-        target = self._active_target_label.lower()
-        match = next((t for t in tracks if t.label.lower() == target), None)
+        target = YOLODetector._canonical_target(self._active_target_label)
+        match = next((
+            t for t in tracks
+            if YOLODetector._canonical_target(t.label) == target
+        ), None)
         now = time.time()
         if match is None:
             if self._active_target and now - self._active_target["lastSeen"] > 3.0:
@@ -1235,7 +1318,8 @@ class LuminaOrchestrator:
         }
         if (int(match.hits) >= self._target_min_frames and
                 self._pending_query_text and not self._pending_live_response_sent and
-                self._pending_query_target == match.label.lower() and
+                YOLODetector._canonical_target(self._pending_query_target) ==
+                YOLODetector._canonical_target(match.label) and
                 time.monotonic() - self._pending_query_started <= 20.0):
             self._pending_live_response_sent = True
             asyncio.get_running_loop().create_task(
@@ -1243,33 +1327,75 @@ class LuminaOrchestrator:
             )
 
     async def _publish_pending_live_query(self) -> None:
-        """Re-evaluate the pending request when live verification completes."""
+        """Answer a pending request as soon as its target becomes visible."""
         raw_text = self._pending_query_text
         if not raw_text:
             return
+        target = self._pending_query_target
+        # Claim the request before awaiting any broadcasts. The focused-scan
+        # completion task may finish at the same instant; clearing first makes
+        # exactly one of the two paths own the final answer/navigation start.
+        self._pending_query_text = ""
+        self._pending_query_target = ""
         if self._broadcast:
             await self._broadcast({
                 "type": "search_status", "status": "verified",
-                "target": self._pending_query_target,
-                "text": f"Found {self._pending_query_target} in the live camera.",
+                "target": target,
+                "text": f"Found {target} in the live camera.",
             })
-        if self._librarian:
-            await event_bus.publish(
-                "system/query_received", QueryPayload(raw_text=raw_text),
-                publisher="LIVE_TARGET_VERIFIER",
+        visible = self._find_visible_target_track(target)
+        if visible is not None:
+            await self._complete_visible_find(raw_text, visible)
+        elif (self._active_target and
+              YOLODetector._canonical_target(self._active_target.get("label", "")) ==
+              YOLODetector._canonical_target(target) and
+              time.time() - float(self._active_target.get("lastSeen", 0.0)) <= 3.0):
+            # The live loop may advance the tracker between verification and
+            # this task running. The verified state and persisted memory are
+            # still valid, so never leave a "Found" status without an answer.
+            await self._broadcast_active_target_response(raw_text)
+            await self._start_navigation_to_memory(target)
+
+    def _promote_requested_track(self, track) -> bool:
+        """Persist a user-confirmed live match so navigation can lock to it.
+
+        Ambient objects still require the normal multi-frame verification.
+        This narrowly promotes only the exact object the user requested after
+        the focused detector has returned a usable metric position.
+        """
+        if not hasattr(self, "_persistent_memory") or not hasattr(self, "_pose_tracker"):
+            return False
+        confidence = float(getattr(getattr(track, "det", None), "confidence", 0.0))
+        distance = float(getattr(track, "smoothed_distance", 0.0))
+        if confidence < 0.30 or not 0.10 <= distance <= 12.0:
+            return False
+        self._persistent_memory.update_tracks([track], self._pose_tracker.pose)
+        return True
+
+    async def _start_navigation_to_memory(self, label: str) -> None:
+        """Start (or switch) guidance after a successful location query."""
+        if label == "eyeglasses" or not hasattr(self, "_goal_navigator"):
+            return
+        active_label = self._goal_navigator.active_label
+        if active_label and active_label.lower() != label.lower():
+            self._goal_navigator.cancel()
+        event = self.start_goal(label)
+        if event.get("status") not in {"not_found", "unreliable"} and self._broadcast:
+            await self._broadcast(event)
+
+    async def _complete_visible_find(self, query_text: str, track) -> None:
+        """Atomically turn a visible detection into an answer and a journey."""
+        # Location speech is the latency-critical guarantee. A disk or goal
+        # state error must not suppress a successful visual answer.
+        await self._broadcast_active_target_response(query_text)
+        try:
+            self._promote_requested_track(track)
+            await self._start_navigation_to_memory(
+                YOLODetector._canonical_target(str(getattr(track, "label", "")))
             )
-        elif self._active_target and self._broadcast:
-            await self._broadcast({
-                "type": "response",
-                "text": (f"{self._active_target['direction']}. Your "
-                         f"{self._active_target['label']} is about "
-                         f"{self._active_target['distance']:.1f} metres away."),
-                "target": raw_text,
-                "confidence": self._active_target["confidence"],
-                "critic_approved": True,
-                "active_target": self._active_target,
-            })
-        self._pending_query_text = ""
+        except Exception:
+            log.exception("Could not start navigation for visible target '%s'",
+                          getattr(track, "label", "object"))
 
     def _live_candidates(self, target: str) -> list[MemorySearchResult]:
         """Expose a verified visible/recent target to the Librarian first."""
@@ -1370,9 +1496,44 @@ class LuminaOrchestrator:
             "goal": event,
         })
 
+    async def _broadcast_active_target_response(self, query_text: str) -> None:
+        """Send a direct answer from the target currently drawn on camera."""
+        state = self._active_target
+        if not state or not self._broadcast:
+            return
+        clock, _instruction = to_clock_direction(float(state["relativeAngle"]))
+        self._last_response_query = query_text
+        self._last_response_at = time.monotonic()
+        worn_eyeglasses = (
+            state["label"] == "eyeglasses" and
+            state.get("source") == "opencv-eyeglasses" and
+            float(state["distance"]) <= 1.2
+        )
+        text = ("You are wearing your eyeglasses; they are on your face."
+                if worn_eyeglasses else
+                f"Your {state['label']} is at {clock}, about {state['distance']:.1f} metres away.")
+        await self._broadcast({
+            "type": "response",
+            "text": text,
+            "target": query_text,
+            "object": state["label"],
+            "visible": True,
+            "confidence": state["confidence"],
+            "navigation": {
+                "distance_m": state["distance"],
+                "direction": state["direction"],
+                "clock_direction": clock,
+                "visible": True,
+            },
+            "critic_approved": True,
+            "active_target": state,
+        })
+
     async def _broadcast_location_response(self, query_text: str, location: dict) -> None:
         if not self._broadcast:
             return
+        self._last_response_query = query_text
+        self._last_response_at = time.monotonic()
         direction = natural_direction(location["direction"])
         if location["visible"]:
             text = f"Your {location['object']} is {direction}, about {location['distance']:.1f} metres away."
