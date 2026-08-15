@@ -1,4 +1,4 @@
-"""Lumina v4 — FastAPI Application + Config + LLM + Database
+"""DrishtiSense v4 — FastAPI Application + Config + LLM + Database
 
 v4 upgrades over v3:
   ┌───────────────────────────────────────────────────────────────┐
@@ -467,7 +467,7 @@ class LLMClient:
 
 # ── Prompts ───────────────────────────────────────────────────
 
-COORDINATOR_SYSTEM = """You are Lumina's Coordinator — the cognitive core of an assistive navigation system for visually impaired users.
+COORDINATOR_SYSTEM = """You are DrishtiSense's Coordinator — the cognitive core of an assistive navigation system for visually impaired users.
 
 Your role:
 1. Parse the user's natural language query to extract the TARGET object they are searching for.
@@ -482,7 +482,7 @@ User: "where are my car keys?" → {"target": "keys", "intent": "find", "raw_que
 User: "I need a drink" → {"target": "bottle", "intent": "find", "raw_query": "I need a drink"}
 """
 
-RESPONSE_SYSTEM = """You are Lumina — a calm, precise spatial intelligence built for one person.
+RESPONSE_SYSTEM = """You are DrishtiSense — a calm, precise spatial intelligence built for one person.
 
 You speak in short, confident sentences. You never say "I think" or "maybe."
 You state what you know and how confident you are. Numbers are exact.
@@ -727,6 +727,7 @@ class ConnectionManager:
 
     def __init__(self):
         self._connections: Set[WebSocket] = set()
+        self._send_locks: dict[WebSocket, asyncio.Lock] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -738,36 +739,86 @@ class ConnectionManager:
         await ws.accept()
         async with self._lock:
             self._connections.add(ws)
+            self._send_locks[ws] = asyncio.Lock()
         _api_log.info(f"Client connected — total: {len(self._connections)}")
 
     async def disconnect(self, ws: WebSocket):
         async with self._lock:
             self._connections.discard(ws)
+            self._send_locks.pop(ws, None)
         _api_log.info(f"Client disconnected — total: {len(self._connections)}")
+
+    async def send(self, ws: WebSocket, data: dict) -> None:
+        """Serialize all direct and broadcast writes for one ASGI socket."""
+        async with self._lock:
+            send_lock = self._send_locks.get(ws)
+        if send_lock is None:
+            raise WebSocketDisconnect()
+        async with send_lock:
+            await ws.send_text(json.dumps(data))
 
     async def broadcast(self, data: dict):
         if not self._connections:
             return
-        payload = json.dumps(data)
         dead: Set[WebSocket] = set()
         async with self._lock:
             targets = list(self._connections)
         for ws in targets:
             try:
-                await ws.send_text(payload)
+                await self.send(ws, data)
             except Exception:
                 dead.add(ws)
         if dead:
             async with self._lock:
                 self._connections -= dead
+                for ws in dead:
+                    self._send_locks.pop(ws, None)
+            for ws in dead:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
 
 
 manager = ConnectionManager()
 
 
+async def _dispatch_websocket_message(ws: WebSocket, orchestrator, msg: dict) -> None:
+    """Handle one client message without owning the connection lifecycle."""
+    msg_type = msg.get("type")
+    if msg_type == "query":
+        text = msg.get("text", "").strip()
+        if text:
+            await orchestrator.query(text)
+    elif msg_type == "start_goal":
+        label = msg.get("label", "").strip()
+        if label:
+            await orchestrator._broadcast_goal(orchestrator.start_goal(label))
+    elif msg_type == "cancel_goal":
+        await orchestrator._broadcast_goal(orchestrator.cancel_goal())
+    elif msg_type == "camera_pose":
+        try:
+            await orchestrator.update_camera_pose(
+                x=msg["x"], y=msg.get("y", 0.0), z=msg["z"],
+                yaw_deg=msg["yaw_deg"], source=msg.get("source", "arcore"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            await manager.send(ws, {
+                "type": "error", "message": f"Invalid camera pose: {exc}",
+            })
+    elif msg_type == "set_open_vocab":
+        orchestrator.set_open_vocab_targets(msg.get("classes", []))
+    elif msg_type == "ping":
+        await manager.send(ws, {"type": "pong"})
+    else:
+        await manager.send(ws, {
+            "type": "error", "message": f"Unknown message type: {msg_type}",
+        })
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _api_log.info("Starting Lumina v4 Orchestrator…")
+    _api_log.info("Starting DrishtiSense v4 Orchestrator…")
     from orchestrator import orchestrator as _orc
     # Cache on app.state so route handlers don't re-import each call
     app.state.orchestrator = _orc
@@ -784,7 +835,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Lumina Spatial AI",
+    title="DrishtiSense Spatial AI",
     description="Multi-Agent Embodied AI for Visually Impaired Navigation — v4",
     version="4.0.0",
     lifespan=lifespan,
@@ -806,7 +857,10 @@ app.mount("/ui", StaticFiles(directory=str(_UI_DIR)), name="ui")
 @app.get("/", response_class=HTMLResponse)
 async def camera_preview():
     """Product interface for live spatial assistance."""
-    return FileResponse(_UI_DIR / "index.html")
+    return FileResponse(
+        _UI_DIR / "index.html",
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.get("/camera.jpg")
@@ -855,41 +909,23 @@ async def websocket_endpoint(ws: WebSocket):
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
-                await ws.send_text(json.dumps({"type": "error", "message": "Invalid JSON"}))
+                await manager.send(ws, {"type": "error", "message": "Invalid JSON"})
                 continue
-
-            msg_type = msg.get("type")
-            if msg_type == "query":
-                text = msg.get("text", "").strip()
-                if text:
-                    await orchestrator.query(text)
-            elif msg_type == "start_goal":
-                label = msg.get("label", "").strip()
-                if label:
-                    await orchestrator._broadcast_goal(orchestrator.start_goal(label))
-            elif msg_type == "cancel_goal":
-                await orchestrator._broadcast_goal(orchestrator.cancel_goal())
-            elif msg_type == "camera_pose":
-                try:
-                    await orchestrator.update_camera_pose(
-                        x=msg["x"], y=msg.get("y", 0.0), z=msg["z"],
-                        yaw_deg=msg["yaw_deg"], source=msg.get("source", "arcore"),
-                    )
-                except (KeyError, TypeError, ValueError) as exc:
-                    await ws.send_text(json.dumps({
-                        "type": "error", "message": f"Invalid camera pose: {exc}",
-                    }))
-            elif msg_type == "set_open_vocab":
-                # v4: allow frontend to set open-vocabulary detection targets
-                classes = msg.get("classes", [])
-                orchestrator.set_open_vocab_targets(classes)
-            elif msg_type == "ping":
-                await ws.send_text(json.dumps({"type": "pong"}))
-            else:
-                await ws.send_text(json.dumps({
-                    "type": "error",
-                    "message": f"Unknown message type: {msg_type}",
-                }))
+            try:
+                await _dispatch_websocket_message(ws, orchestrator, msg)
+            except Exception:
+                # A failed detector/model/query must not tear down the socket.
+                # Keep this error boundary inside the receive loop so the same
+                # client can immediately retry and continue receiving frames.
+                _api_log.exception("WebSocket message handling failed: %s", msg.get("type"))
+                error_message = {
+                    "type": "response" if msg.get("type") == "query" else "error",
+                    "text": "I couldn't complete that request. The live connection is still available; please try again.",
+                    "message": "Request processing failed",
+                    "target": msg.get("text", ""),
+                    "critic_approved": False,
+                }
+                await manager.send(ws, error_message)
     except WebSocketDisconnect:
         pass
     finally:
