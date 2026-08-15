@@ -4,7 +4,8 @@ const state = {
   detections: [], memory: [], safePath: null, safety: null, safetyTimer: null,
   goal: null, finding: false, findTarget: "", focused: null, focusedTimer: null,
   findTimer: null, socketOpen: false, showAll: false, lastMessage: null, recognition: null,
-  lastSpoken: "", lastSpokenAt: 0, lastGoalCommand: "", targetState: null,
+  lastSpoken: "", lastSpokenAt: 0, spokenKeys: new Map(), activeSpeech: null,
+  activeSpeechPriority: 0, speechToken: 0, lastGoalCommand: "", targetState: null,
   queryTimer: null, searchOutcome: null, refreshInFlight: false,
 };
 const $ = id => document.getElementById(id);
@@ -362,14 +363,38 @@ function setVoiceState(name) {
   $("waveform").classList.toggle("active", ["listening", "speaking"].includes(name));
 }
 
-function speak(text, force = false) {
-  const clean = cleanAssistantText(text); if (!clean || !("speechSynthesis" in window)) return;
-  const now = Date.now(); if (!force && clean === state.lastSpoken && now-state.lastSpokenAt < 4000) return;
-  state.lastSpoken=clean; state.lastSpokenAt=now; speechSynthesis.cancel(); const utterance=new SpeechSynthesisUtterance(clean); utterance.rate=.96;
-  utterance.onstart=()=>setVoiceState("speaking"); utterance.onend=()=>setVoiceState("ready"); speechSynthesis.speak(utterance);
+function semanticSpeechKey(text) {
+  return cleanAssistantText(text).toLowerCase()
+    .replace(/\b\d+(?:\.\d+)?\b/g,"#")
+    .replace(/\s+/g," ").trim();
 }
 
-function showResponse(message, shouldSpeak = true) {
+function stopSpeaking() {
+  if (!("speechSynthesis" in window)) return;
+  state.speechToken+=1; state.activeSpeech=null; state.activeSpeechPriority=0;
+  speechSynthesis.cancel();
+}
+
+function speak(text, options = {}) {
+  const clean=cleanAssistantText(text); if(!clean||!("speechSynthesis" in window))return false;
+  const config=typeof options==="boolean"?{interrupt:options}:options;
+  const now=Date.now(), key=config.key||semanticSpeechKey(clean);
+  const cooldownMs=Number(config.cooldownMs??7000), priority=Number(config.priority??1);
+  if(now-Number(state.spokenKeys.get(key)||0)<cooldownMs)return false;
+  const alreadySpeaking=Boolean(state.activeSpeech||speechSynthesis.speaking||speechSynthesis.pending);
+  if(alreadySpeaking&&priority<=state.activeSpeechPriority&&!config.interrupt)return false;
+  if(alreadySpeaking)stopSpeaking();
+
+  state.spokenKeys.set(key,now);
+  if(state.spokenKeys.size>60){const oldest=state.spokenKeys.keys().next().value;state.spokenKeys.delete(oldest)}
+  state.lastSpoken=clean;state.lastSpokenAt=now;state.activeSpeech=key;state.activeSpeechPriority=priority;
+  const token=++state.speechToken, utterance=new SpeechSynthesisUtterance(clean);utterance.rate=.96;
+  utterance.onstart=()=>{if(token===state.speechToken)setVoiceState("speaking")};
+  const finish=()=>{if(token===state.speechToken){state.activeSpeech=null;state.activeSpeechPriority=0;setVoiceState("ready")}};
+  utterance.onend=finish;utterance.onerror=finish;speechSynthesis.speak(utterance);return true;
+}
+
+function showResponse(message, shouldSpeak = true, speechOptions = {}) {
   clearTimeout(state.queryTimer); state.queryTimer=null;
   const raw = typeof message === "string" ? message : message?.text;
   let text = cleanAssistantText(raw || "");
@@ -397,12 +422,13 @@ function showResponse(message, shouldSpeak = true) {
       state.searchOutcome = null;
     }
   }
-  $("assistantResponse").textContent=text; setVoiceState("ready"); if (shouldSpeak) speak(text);
+  $("assistantResponse").textContent=text; if(!state.activeSpeech)setVoiceState("ready"); if(shouldSpeak)speak(text,speechOptions);
   renderAll();
 }
 
 function sendQuery(text) {
   const query=String(text||"").trim(); if (!query) return;
+  stopSpeaking();
   const requested = requestedObjectFromQuery(query);
   $("userUtterance").textContent=`“${query}”`; $("query").value=""; setVoiceState("processing");
 
@@ -418,7 +444,7 @@ function sendQuery(text) {
     showResponse({
       type:"response",text:response,target:query,object:requested,visible:true,distance_m:distance,
       navigation:{distance_m:distance,direction,visible:true},critic_approved:true,
-    });
+    },true,{key:`response:${query}`,cooldownMs:7000,priority:1});
     // The instant UI answer must still reach the backend. It promotes the
     // verified track into world memory and starts turn-by-turn guidance.
     if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:"query",text:query}));
@@ -448,7 +474,7 @@ function setupVoice() {
   recognition.onstart=()=>setVoiceState("listening");
   recognition.onresult=event=>{ let transcript="",finalText=""; for(let i=event.resultIndex;i<event.results.length;i++){transcript+=event.results[i][0].transcript;if(event.results[i].isFinal)finalText+=event.results[i][0].transcript;} $("userUtterance").textContent=`“${transcript.trim()}”`; if(finalText.trim())sendQuery(finalText); };
   recognition.onerror=event=>setVoiceState(event.error==="not-allowed"?"Microphone permission was denied. You can type instead.":"I could not hear that. Please try again."); recognition.onend=()=>{if($("voiceButton").classList.contains("listening"))setVoiceState("ready")};
-  $("voiceButton").onclick=()=>{ if($("voiceButton").classList.contains("listening"))recognition.stop(); else recognition.start(); };
+  $("voiceButton").onclick=()=>{ if($("voiceButton").classList.contains("listening"))recognition.stop(); else {stopSpeaking();recognition.start()} };
 }
 
 function renderFocused() {
@@ -515,15 +541,16 @@ function handleSocketMessage(event) {
     setVoiceState(message.status==="verified"?"ready":"processing");
     renderAll();
   }
-  else if(message.type==="response"){showResponse(message)}
+  else if(message.type==="response"){showResponse(message,true,{key:`response:${message.target||semanticSpeechKey(message.text||"")}`,cooldownMs:7000,priority:1})}
   else if(message.type==="error"){showResponse(message.message||"The request could not be completed.",false)}
   else if(message.type==="goal_update"){
     const previous=state.lastGoalCommand, previousTarget=state.findTarget; state.lastGoalCommand=message.command||message.status; state.goal=["idle","cancelled"].includes(message.status)?null:message; state.finding=false; state.findTarget=["idle","cancelled"].includes(message.status)?"":(message.target||state.findTarget);
     if (state.goal && previousTarget!==state.findTarget && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"set_open_vocab",classes:[state.findTarget]}));
-    if(previous!==state.lastGoalCommand||["blocked","complete","lost","unreliable"].includes(message.status))showResponse(message,true); renderAll();
+    const urgentGoal=["blocked","lost","unreliable"].includes(message.status),completedGoal=message.status==="complete";
+    if(previous!==state.lastGoalCommand||urgentGoal||completedGoal)showResponse(message,true,{key:`goal:${message.target||"object"}:${state.lastGoalCommand}`,cooldownMs:10000,priority:urgentGoal?3:completedGoal?2:1,interrupt:urgentGoal||completedGoal}); renderAll();
   }
   else if(message.type==="safety_alert"){
-    state.safety=message;clearTimeout(state.safetyTimer);state.safetyTimer=setTimeout(()=>{state.safety=null;renderAll()},4500);renderAll();if(message.message)speak(message.message,true);
+    state.safety=message;clearTimeout(state.safetyTimer);state.safetyTimer=setTimeout(()=>{state.safety=null;renderAll()},4500);renderAll();if(message.message)speak(message.message,{key:`safety:${message.level}:${message.label||"obstacle"}`,cooldownMs:message.level==="critical"?10000:20000,priority:4,interrupt:true});
   }
   else if(message.type==="memory_update"){refreshWorldMemory()}
   else if(message.type==="world_update"&&message.goal){state.goal=normalizeGoal(message.goal)||state.goal;renderAll()}
