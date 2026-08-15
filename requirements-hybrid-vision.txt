@@ -1,4 +1,4 @@
-# Optional focused-search stack. Lumina continues with YOLO-World when these
+# Optional focused-search stack. DrishtiSense continues with YOLO-World when these
 # packages or their model weights are unavailable.
 torch>=2.2
 torchvision>=0.17
@@ -6,3 +6,6 @@ transformers>=4.46
 accelerate>=0.30
 pillow>=10.0
 ultralytics>=8.3
+# OpenCV 5 wrapper builds may omit CascadeClassifier; worn-eyeglasses
+# detection requires the complete objdetect API included in stable 4.14.
+opencv-python>=4.14,<5

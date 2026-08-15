@@ -33,6 +33,8 @@ Thumbs.db
 
 # Logs and local model weights (download or configure these locally)
 *.log
-weights/
+weights/*
+!weights/haarcascades/
+!weights/haarcascades/*.xml
 *.pt
 *.onnx
