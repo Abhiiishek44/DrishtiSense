@@ -7,7 +7,7 @@ from unittest.mock import patch
 from goal_navigation import EnvironmentalChangeDetector, GoalNavigator
 from models import BoundingBox, Detection
 from spatial_memory import CameraPose, CameraPoseTracker, PersistentSpatialMemory
-from vision import HybridTargetDetector, YOLODetector
+from vision import DepthFusionEngine, HybridTargetDetector, Track, YOLODetector
 
 
 def track(track_id, label, x, z, confidence=0.9, azimuth=0.0):
@@ -25,6 +25,35 @@ def track(track_id, label, x, z, confidence=0.9, azimuth=0.0):
 
 
 class SpatialNavigationScenarioTest(unittest.TestCase):
+    def test_cropped_close_person_uses_safe_width_distance(self):
+        detection = Detection(
+            label="person", confidence=0.95,
+            bbox=BoundingBox(x1=0, y1=0, x2=500, y2=478),
+            frame_width=640, frame_height=480,
+        )
+        person = Track(id=4, label="person", det=detection, hits=3)
+        depth = DepthFusionEngine(fov_h_deg=62.0)
+        depth.calibrate(640, 480)
+
+        distance, _velocity = depth.update(person)
+
+        self.assertLess(distance, 0.8)
+
+    def test_chair_goal_stops_at_safe_standoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            memory = PersistentSpatialMemory(str(Path(directory) / "world.json"))
+            pose = CameraPose()
+            memory.update_tracks([track(9, "chair", 0.0, 0.8)], pose)
+
+            event = GoalNavigator(arrival_distance_m=0.3).start(
+                "chair", memory, pose, [9]
+            )
+
+            self.assertEqual(event["status"], "complete")
+            self.assertEqual(event["command"], "reach")
+            self.assertIn("Stop here", event["text"])
+            self.assertIn("STOP HERE", event["hud"])
+
     def test_bottle_memory_goal_obstacle_and_arrival(self):
         """Requested demo: remember bottle, guide, warn, and complete."""
         with tempfile.TemporaryDirectory() as directory:
@@ -225,6 +254,7 @@ class OpenVocabularyPromptTest(unittest.TestCase):
         self.assertIn("picture frame", frame_prompts)
         self.assertIn("framed photograph", frame_prompts)
         self.assertEqual(frame_labels["photo frame"], "picture frame")
+        self.assertEqual(detector._canonical_target("photo picture"), "picture frame")
         self.assertIn("polo shirt", shirt_prompts)
         self.assertEqual(shirt_labels["shirt"], "shirt")
 
@@ -270,6 +300,39 @@ class OpenVocabularyPromptTest(unittest.TestCase):
         self.assertGreater(crop.shape[0], 100)
         self.assertEqual(offset_y, 40)
         self.assertLessEqual(offset_x, 160)
+
+    def test_offline_eyeglasses_cascades_and_eye_pair_geometry(self):
+        detector = HybridTargetDetector("unused", "unused")
+        self.assertTrue(detector._load_eyeglasses_cascades())
+
+        aligned = detector._best_eyeglasses_pair(
+            [(20, 30, 28, 20), (78, 31, 29, 21)], region_w=140, region_h=100,
+        )
+        misaligned = detector._best_eyeglasses_pair(
+            [(20, 15, 28, 20), (78, 70, 29, 21)], region_w=140, region_h=100,
+        )
+        self.assertIsNotNone(aligned)
+        self.assertGreaterEqual(aligned[-1], 0.65)
+        self.assertIsNone(misaligned)
+
+    def test_worn_eyeglasses_fallback_runs_before_grounding_dino(self):
+        import numpy as np
+        detector = HybridTargetDetector("unused", "unused")
+        detector.select_target("eye glasses")
+        frame = np.zeros((120, 160, 3), dtype=np.uint8)
+        local = Detection(
+            label="eyeglasses", confidence=0.76,
+            bbox=BoundingBox(x1=45, y1=35, x2=115, y2=65),
+            frame_width=160, frame_height=120, source="opencv-eyeglasses",
+        )
+        detector._detect_worn_eyeglasses = lambda *_args: [local]
+        detector._ensure_loaded = lambda: self.fail("Grounding DINO should not load")
+
+        results = detector.search(frame, "eyeglasses", [])
+
+        self.assertEqual(results, [local])
+        self.assertEqual(detector.status()["target"], "eyeglasses")
+        self.assertTrue(detector.status()["locked"])
 
 
 if __name__ == "__main__":
