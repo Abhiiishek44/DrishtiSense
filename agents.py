@@ -1,5 +1,5 @@
 """
-Lumina v5 — All Agents  (EventBus-native)
+DrishtiSense v5 — All Agents  (EventBus-native)
 
 Architecture generation: v5
 Compatible with: orchestrator.py (v5 bootstrap)
@@ -248,7 +248,8 @@ _OBJECT_SYNONYMS = {
     "clicker": "remote", "laptop": "laptop", "computer": "laptop",
     "keys": "keys", "key": "keys", "keychain": "keys",
     "fruit": "apple", "snack": "banana",
-    "photo frame": "picture frame", "photograph frame": "picture frame",
+    "photo frame": "picture frame", "photo picture": "picture frame",
+    "photograph frame": "picture frame",
     "towel": "towel", "bath towel": "towel", "hand towel": "towel",
     "hanging towel": "towel", "hanging cloth": "towel",
     "hanging cloths": "towel", "hanging clothes": "towel",
@@ -264,7 +265,12 @@ _STOP_WORDS = {
 
 def _deterministic_parse(text: str) -> dict:
     t = text.lower().strip()
-    intent = "find"
+    # Do not assume every utterance is an object search.  The old default
+    # turned greetings and unrelated questions into focused camera scans for
+    # the final word in the sentence (for example, "how are you" searched for
+    # "you").  Only an explicit find phrase opts into the expensive vision
+    # and memory pipeline.
+    intent = "unknown"
     for p in _INVENTORY_PATTERNS:
         if re.search(p, t): intent = "inventory"; break
     for p in _FIND_PATTERNS:

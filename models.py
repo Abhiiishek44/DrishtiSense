@@ -1,5 +1,5 @@
 """
-Lumina v4 — Core Data Models
+DrishtiSense v4 — Core Data Models
 Single source of truth for all data structures.
 
 v4 upgrades over v3:
@@ -36,7 +36,7 @@ KNOWN_HEIGHTS_M: dict[str, float] = {
     "handbag": 0.30, "suitcase": 0.70,
     "umbrella": 0.90, "remote": 0.18, "sports ball": 0.22,
     "apple": 0.09, "banana": 0.20, "key": 0.08, "keys": 0.08,
-    "keychain": 0.12,
+    "keychain": 0.12, "eyeglasses": 0.06,
 }
 DEFAULT_OBJECT_HEIGHT_M = 0.30
 
