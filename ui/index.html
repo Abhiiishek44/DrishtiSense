@@ -4,15 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#090c0e">
-  <title>Lumina · Spatial guidance</title>
-  <link rel="stylesheet" href="/ui/app.css">
+  <title>DrishtiSense · Spatial guidance</title>
+  <link rel="stylesheet" href="/ui/app.css?v=20260815-5">
 </head>
 <body>
   <main class="app">
     <header class="topbar">
-      <a class="brand" href="/" aria-label="Lumina home">
+      <a class="brand" href="/" aria-label="DrishtiSense home">
         <span class="brand-mark" aria-hidden="true"><i></i></span>
-        <span><strong>LUMINA</strong><small>Spatial guidance</small></span>
+        <span><strong>DRISHTISENSE</strong><small>Spatial guidance</small></span>
       </a>
       <div class="system-state">
         <span id="modeBadge" class="mode-badge">EXPLORE</span>
@@ -38,10 +38,18 @@
 
       <aside class="goal-rail" aria-labelledby="goalHeading">
         <section id="goalPanel" class="goal-panel goal--idle">
-          <span class="kicker">CURRENT GOAL</span>
-          <div class="goal-state" id="goalState">IDLE</div>
-          <h2 id="goalHeading">Ready when you are</h2>
-          <p id="goalDistance" class="goal-distance">Ask Lumina to find or guide you to an object.</p>
+          <header class="goal-panel-head">
+            <span class="kicker">CURRENT JOURNEY</span>
+            <span class="goal-state" id="goalState"><i aria-hidden="true"></i>Ready</span>
+          </header>
+          <div class="goal-identity">
+            <span class="goal-marker" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 21s6-5.2 6-11a6 6 0 1 0-12 0c0 5.8 6 11 6 11Z"/><circle cx="12" cy="10" r="2.2"/></svg>
+            </span>
+            <div><p id="goalContext" class="goal-context">Standing by</p><h2 id="goalHeading">Ready when you are</h2></div>
+          </div>
+          <p id="goalDistance" class="goal-distance">Ask DrishtiSense to find or guide you to an object.</p>
+          <div class="goal-progress" aria-hidden="true"><span id="goalProgress"></span></div>
           <dl id="goalFacts" class="goal-facts"></dl>
           <button id="cancelGoal" class="text-button" type="button" hidden>Cancel guidance</button>
         </section>
@@ -55,18 +63,18 @@
     <section class="support-layout">
       <section class="voice-panel" aria-labelledby="voiceHeading">
         <div class="voice-control">
-          <button id="voiceButton" class="mic-button" type="button" aria-label="Ask Lumina by voice">
+          <button id="voiceButton" class="mic-button" type="button" aria-label="Ask DrishtiSense by voice">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V6a3.5 3.5 0 1 0-7 0v6a3.5 3.5 0 0 0 3.5 3.5Zm-7-4a7 7 0 0 0 14 0M12 18.5V22M8.5 22h7"/></svg>
           </button>
           <div id="waveform" class="waveform" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
         </div>
         <div class="conversation">
-          <span class="kicker" id="voiceHeading">ASK LUMINA</span>
+          <span class="kicker" id="voiceHeading">ASK DRISHTISENSE</span>
           <p id="voiceState" class="voice-state">Tap the microphone and speak naturally.</p>
           <p id="userUtterance" class="user-utterance">“Take me to my bottle.”</p>
           <div id="assistantResponse" class="assistant-response" role="status" aria-live="polite">I’m ready to help you move through your space.</div>
           <form id="queryForm" class="text-query">
-            <input id="query" type="text" placeholder="Or type a request" autocomplete="off" aria-label="Type a request for Lumina">
+            <input id="query" type="text" placeholder="Or type a request" autocomplete="off" aria-label="Type a request for DrishtiSense">
             <button type="submit">Send</button>
           </form>
           <details class="find-tools">
@@ -95,6 +103,6 @@
       <pre id="diagnostics">No events received.</pre>
     </details>
   </main>
-  <script src="/ui/app.js" defer></script>
+  <script src="/ui/app.js?v=20260815-5" defer></script>
 </body>
 </html>
