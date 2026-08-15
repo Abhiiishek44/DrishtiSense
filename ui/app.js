@@ -5,7 +5,7 @@ const state = {
   goal: null, finding: false, findTarget: "", focused: null, focusedTimer: null,
   findTimer: null, socketOpen: false, showAll: false, lastMessage: null, recognition: null,
   lastSpoken: "", lastSpokenAt: 0, lastGoalCommand: "", targetState: null,
-  queryTimer: null,
+  queryTimer: null, searchOutcome: null, refreshInFlight: false,
 };
 const $ = id => document.getElementById(id);
 const escapeHtml = (value = "") => String(value).replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
@@ -33,7 +33,7 @@ function cleanAssistantText(value = "") {
 }
 
 function currentTarget() {
-  return labelKey(state.targetState?.label || state.goal?.target || state.goal?.label || state.findTarget);
+  return labelKey(state.targetState?.label || state.goal?.target || state.goal?.label || state.searchOutcome?.target || state.findTarget);
 }
 
 function normaliseRequestedObject(value) {
@@ -42,7 +42,7 @@ function normaliseRequestedObject(value) {
     .replace(/^(?:where (?:is|are)|find|locate|show me|help me find|take me to|guide me to|navigate me to)\s+/i, "")
     .replace(/^(?:my|the|a|an)\s+/i, "")
     .replace(/\s+(?:please|for me)$/i, "").trim();
-  const aliases = {"photo frame":"picture frame", "wall picture":"picture frame", "t shirt":"shirt", "t-shirt":"shirt", "key":"keys", "keychain":"keys", "phone":"cell phone", "mobile":"cell phone", "eye glasses":"eyeglasses", "glasses":"eyeglasses", "spectacles":"eyeglasses"};
+  const aliases = {"photo frame":"picture frame", "photo picture":"picture frame", "wall picture":"picture frame", "t shirt":"shirt", "t-shirt":"shirt", "key":"keys", "keychain":"keys", "phone":"cell phone", "mobile":"cell phone", "eye glasses":"eyeglasses", "glasses":"eyeglasses", "spectacles":"eyeglasses"};
   return aliases[target] || target;
 }
 
@@ -58,6 +58,7 @@ function activateFindMode(target) {
   clearTimeout(state.findTimer);
   state.findTarget = label;
   state.finding = !state.goal;
+  state.searchOutcome = null;
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:"set_open_vocab", classes:[label]}));
   state.findTimer = setTimeout(() => {
     if (!state.goal) {
@@ -74,7 +75,7 @@ function activateFindMode(target) {
 function uiMode() {
   const status = state.goal?.status;
   if (status && !["idle", "cancelled", "not_found"].includes(status)) return "navigate";
-  if (state.finding || state.findTarget) return "find";
+  if (state.finding) return "find";
   return "explore";
 }
 
@@ -149,7 +150,9 @@ function goalViewState() {
   if (["blocked"].includes(status)) return "obstacle";
   if (["lost", "unreliable", "not_found"].includes(status)) return "lost";
   if (status === "active") return "navigating";
-  if (state.finding || state.findTarget) return "finding";
+  if (state.finding) return "finding";
+  if (state.searchOutcome?.status === "found") return "located";
+  if (state.searchOutcome?.status === "not_found") return "not-found";
   return "idle";
 }
 
@@ -157,13 +160,19 @@ function renderGoal() {
   const view = goalViewState();
   const goal = state.goal;
   const active = canonicalTarget();
-  const target = active?.label || state.findTarget;
+  const outcome = state.searchOutcome;
+  const target = active?.label || outcome?.target || state.findTarget;
   const panel = $("goalPanel");
   panel.className = `goal-panel goal--${view}`;
-  $("goalState").textContent = ({idle:"IDLE", finding:"FINDING", navigating:"NAVIGATING", obstacle:"OBSTACLE", arrived:"ARRIVED", lost:"TARGET LOST"})[view];
-  $("goalHeading").textContent = view === "idle" ? "Ready when you are" : view === "arrived" ? `${titleCase(target)} reached` : view === "lost" ? `Find ${titleCase(target)}` : `${view === "finding" ? "Find" : "Reach"} ${titleCase(target)}`;
+  const stateLabels = {idle:"Ready", finding:"Searching", navigating:"On the way", obstacle:"Path blocked", arrived:"Arrived", lost:"Target lost", located:"Located", "not-found":"Not found"};
+  $("goalState").innerHTML = `<i aria-hidden="true"></i>${stateLabels[view]}`;
+  $("goalContext").textContent = ({idle:"Standing by", finding:"Looking through camera + memory", navigating:"Live turn-by-turn guidance", obstacle:"Safety pause", arrived:"Journey complete", lost:"Visual lock interrupted", located:"Latest search result", "not-found":"Search complete"})[view];
+  $("goalHeading").textContent = view === "idle" ? "Ready when you are" : view === "arrived" ? `${titleCase(target)} reached` : view === "lost" ? `Find ${titleCase(target)}` : view === "located" ? `${titleCase(target)} located` : view === "not-found" ? `${titleCase(target)} not in view` : `${view === "finding" ? "Find" : "Reach"} ${titleCase(target)}`;
   const metres = active?.distance ?? null;
-  $("goalDistance").textContent = metres !== null ? `${distanceText(metres)} remaining` : view === "finding" ? "Searching the current view and memory." : view === "idle" ? "Ask Lumina to find or guide you to an object." : "Waiting for a reliable position.";
+  $("goalDistance").textContent = metres !== null ? `${distanceText(metres)} remaining` : view === "located" ? `${distanceText(outcome?.distance)} · ${directionText(outcome?.direction)}` : view === "not-found" ? "No reliable live or remembered location was found." : view === "finding" ? "Checking the current view and recent memory…" : view === "idle" ? "Ask DrishtiSense to find or guide you to an object." : "Waiting for a reliable position.";
+  const progress = ({idle:0, finding:38, navigating:68, obstacle:68, arrived:100, lost:68, located:100, "not-found":100})[view];
+  $("goalProgress").style.width = `${progress}%`;
+  panel.classList.toggle("goal--progressing", view === "finding");
   const facts = [];
   if (view === "navigating" || view === "obstacle" || view === "arrived") {
     facts.push(["Target state", active?.visible ? "Visually locked" : "Reacquiring from remembered position"]);
@@ -171,6 +180,11 @@ function renderGoal() {
     facts.push(["Last visual confirmation", relativeTime(active?.lastSeen)]);
   } else if (view === "lost") {
     facts.push(["Next step", "Stop and slowly scan around"]);
+  } else if (view === "located") {
+    facts.push(["Direction", directionText(outcome?.direction || "nearby")]);
+    facts.push(["Source", outcome?.visible === false ? "Remembered location" : "Live camera"]);
+  } else if (view === "not-found") {
+    facts.push(["Try next", "Pan slowly from left to right, then ask again"]);
   }
   $("goalFacts").innerHTML = facts.map(([name, value]) => `<div><dt>${escapeHtml(name)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
   $("cancelGoal").hidden = !goal || !["active", "blocked"].includes(goal.status);
@@ -216,7 +230,7 @@ function renderGuidance() {
     const status = state.goal.status;
     const text = state.goal.hud || fallbackGoalHud(state.goal);
     const active = canonicalTarget();
-    if (status === "complete") { hud.className = "guidance guidance--arrived"; icon.textContent = "◎"; main.textContent = "YOU'RE HERE"; detail.textContent = `${titleCase(active?.label)} directly ahead · ${distanceText(active?.distance)}`; return; }
+    if (status === "complete") { const safeStop=String(state.goal.hud||"").includes("STOP HERE"); hud.className = "guidance guidance--arrived"; icon.textContent = "◎"; main.textContent = safeStop ? "STOP HERE · TARGET AHEAD" : "YOU'RE HERE"; detail.textContent = `${titleCase(active?.label)} directly ahead · ${distanceText(active?.distance)}`; return; }
     if (["lost", "unreliable", "not_found"].includes(status)) { hud.className = "guidance guidance--critical"; icon.textContent = "?"; main.textContent = "TARGET LOST"; detail.textContent = "Stop and scan around slowly"; return; }
     if (!active?.visible) {
       hud.className = "guidance guidance--warning"; icon.textContent = "↶"; main.textContent = "TARGET LOST";
@@ -342,7 +356,7 @@ function renderAll() {
 }
 
 function setVoiceState(name) {
-  const labels = {ready:"Tap the microphone and speak naturally.", listening:"Listening…", processing:"Understanding your request…", speaking:"Lumina is speaking…", unavailable:"Voice recognition is unavailable in this browser. You can type instead."};
+  const labels = {ready:"Tap the microphone and speak naturally.", listening:"Listening…", processing:"Understanding your request…", speaking:"DrishtiSense is speaking…", unavailable:"Voice recognition is unavailable in this browser. You can type instead."};
   $("voiceState").textContent = labels[name] || name;
   $("voiceButton").classList.toggle("listening", name === "listening");
   $("waveform").classList.toggle("active", ["listening", "speaking"].includes(name));
@@ -365,24 +379,63 @@ function showResponse(message, shouldSpeak = true) {
   }
   if (!text) text="I could not get a reliable answer. Please scan the room and try again.";
   const requested = normaliseRequestedObject(message?.object || requestedObjectFromQuery(message?.target));
-  if (requested) activateFindMode(requested);
+  if (!state.goal) {
+    clearTimeout(state.findTimer);
+    state.finding = false;
+    if (requested) {
+      const navigation = message?.navigation || {};
+      const distance = numeric(navigation.distance_m ?? message?.active_target?.distance ?? message?.distance_m);
+      const found = distance !== null || Boolean(message?.active_target);
+      state.findTarget = requested;
+      state.searchOutcome = {
+        status: found ? "found" : "not_found", target: message?.object || requested,
+        distance, direction: navigation.direction || (navigation.clock_direction ? clockDirection(navigation.clock_direction) : message?.active_target?.direction),
+        visible: navigation.visible ?? message?.visible ?? message?.active_target?.visible,
+      };
+    } else {
+      state.findTarget = "";
+      state.searchOutcome = null;
+    }
+  }
   $("assistantResponse").textContent=text; setVoiceState("ready"); if (shouldSpeak) speak(text);
+  renderAll();
 }
 
 function sendQuery(text) {
   const query=String(text||"").trim(); if (!query) return;
+  const requested = requestedObjectFromQuery(query);
   $("userUtterance").textContent=`“${query}”`; $("query").value=""; setVoiceState("processing");
-  $("assistantResponse").textContent="Searching the live camera and memory…";
+
+  // The live detection list is already verified by the backend. If the
+  // requested object is currently drawn on screen, answer from that same
+  // data immediately instead of entering an unnecessary search workflow.
+  const visible=requested ? rankedDetections().find(item=>labelKey(item.label)===labelKey(requested)) : null;
+  if (visible) {
+    const distance=numeric(visible.distance_m);
+    const direction=directionText(visible.direction||clockDirection(visible.clock_direction));
+    const wornEyeglasses=requested==="eyeglasses"&&visible.source==="opencv-eyeglasses"&&(distance===null||distance<=1.2);
+    const response=wornEyeglasses?"You are wearing your eyeglasses; they are on your face.":`Your ${requested} is ${direction.toLowerCase()}${distance===null?".":`, about ${distance.toFixed(1)} metres away.`}`;
+    showResponse({
+      type:"response",text:response,target:query,object:requested,visible:true,distance_m:distance,
+      navigation:{distance_m:distance,direction,visible:true},critic_approved:true,
+    });
+    // The instant UI answer must still reach the backend. It promotes the
+    // verified track into world memory and starts turn-by-turn guidance.
+    if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:"query",text:query}));
+    return;
+  }
+
+  $("assistantResponse").textContent=requested ? "Searching the live camera and memory…" : "Understanding your request…";
   clearTimeout(state.queryTimer);
-  // Focused vision may need to load its model on the first request.  Do not
-  // replace a live search with a misleading failure while that work is still
-  // running; the backend always sends the final response when it is ready.
+  // The server bounds focused search time. This timer is only a connection
+  // health message; it is not presented as an object-search answer.
   state.queryTimer=setTimeout(()=>{
     state.queryTimer=null;
-    $("assistantResponse").textContent="I’m still searching the live camera and memory. Move the camera slowly across the room.";
-    setVoiceState("processing");
-  },30000);
-  const requested = requestedObjectFromQuery(query);
+    $("assistantResponse").textContent=state.socketOpen
+      ? `I could not confirm ${titleCase(requested||"that object")} in this scan. Move the camera slowly and try once more.`
+      : "The live connection is unavailable. Reconnecting now…";
+    setVoiceState("ready");
+  },26000);
   if (requested) activateFindMode(requested);
   if (ws.readyState !== WebSocket.OPEN) { showResponse("The live connection is unavailable. Please try again in a moment.", false); return; }
   ws.send(JSON.stringify({type:"query",text:query}));
@@ -425,12 +478,18 @@ async function refreshWorldMemory() {
 }
 
 async function refreshData() {
+  if (state.refreshInFlight) return;
+  state.refreshInFlight=true;
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),5000);
   try {
-    const [status,memory,path,goal]=await Promise.all(["/status","/world-memory","/safe-path","/goal"].map(url=>fetch(url).then(response=>response.json())));
+    const [status,memory,path,goal]=await Promise.all(["/status","/world-memory","/safe-path","/goal"].map(url=>fetch(url,{signal:controller.signal}).then(response=>response.json())));
     state.memory=memory.objects||[]; if(!path.error)state.safePath=path; const previousTarget=state.findTarget; const goalSnapshot=normalizeGoal(goal); if(goalSnapshot)state.goal={...(state.goal||{}),...goalSnapshot}; else if(!state.goal||["idle","cancelled"].includes(state.goal.status))state.goal=null;
     if(state.goal?.target && previousTarget!==state.goal.target && ws.readyState===WebSocket.OPEN){state.findTarget=state.goal.target;ws.send(JSON.stringify({type:"set_open_vocab",classes:[state.findTarget]}));}
     $("cameraState").textContent=status.camera?"Live camera":"Camera unavailable"; renderAll();
-  } catch (_) { $("connection").className="connection off"; $("connection").querySelector("span").textContent="Status unavailable"; }
+  } catch (_) {
+    if(!state.socketOpen){$("connection").className="connection off";$("connection").querySelector("span").textContent="Reconnecting"}
+  } finally { clearTimeout(timeout); state.refreshInFlight=false; }
 }
 
 function diagnostics(kind,data){state.lastMessage={kind,data,received_at:new Date().toISOString()};$("diagnostics").textContent=JSON.stringify(state.lastMessage,null,2)}
@@ -438,21 +497,26 @@ function diagnostics(kind,data){state.lastMessage={kind,data,received_at:new Dat
 const camera=$("camera");
 camera.onload=()=>{$("cameraState").textContent="Live camera";renderCameraOverlay()};
 camera.onerror=()=>{$("cameraState").textContent="Camera frame unavailable"};
-const wsScheme=location.protocol==="https:"?"wss":"ws"; const ws=new WebSocket(`${wsScheme}://${location.host}/ws`);
-ws.onopen=()=>{state.socketOpen=true;$("connection").className="connection live";$("connection").querySelector("span").textContent="Live";refreshData()};
-ws.onclose=()=>{state.socketOpen=false;$("connection").className="connection off";$("connection").querySelector("span").textContent="Reconnecting"};
-ws.onerror=()=>{state.socketOpen=false};
-ws.onmessage=event=>{
-  const message=JSON.parse(event.data); diagnostics(message.type,message);
+const wsScheme=location.protocol==="https:"?"wss":"ws";
+let ws=null, reconnectTimer=null, reconnectAttempt=0;
+
+function handleSocketMessage(event) {
+  let message;
+  try { message=JSON.parse(event.data); }
+  catch (_) { diagnostics("socket_error",{message:"The server sent an invalid message."}); return; }
+  diagnostics(message.type,message);
   if(message.type==="frame"){camera.src=`data:image/jpeg;base64,${message.jpeg_b64}`}
-  else if(message.type==="vision_update"){state.detections=message.detections||[];state.targetState=message.target_state||state.targetState;state.safePath=message.safe_path||state.safePath;renderAll()}
+  else if(message.type==="vision_update"){state.detections=message.detections||[];if("target_state" in message)state.targetState=message.target_state;state.safePath=message.safe_path||state.safePath;renderAll()}
   else if(message.type==="vision_error"){$("cameraState").textContent="Vision temporarily unavailable"}
   else if(message.type==="search_status"){
     if(message.status==="verified") { clearTimeout(state.queryTimer); state.queryTimer=null; }
+    state.finding=message.status!=="verified"; state.searchOutcome=null;
     $("assistantResponse").textContent=message.text||"Searching the live camera…";
     setVoiceState(message.status==="verified"?"ready":"processing");
+    renderAll();
   }
   else if(message.type==="response"){showResponse(message)}
+  else if(message.type==="error"){showResponse(message.message||"The request could not be completed.",false)}
   else if(message.type==="goal_update"){
     const previous=state.lastGoalCommand, previousTarget=state.findTarget; state.lastGoalCommand=message.command||message.status; state.goal=["idle","cancelled"].includes(message.status)?null:message; state.finding=false; state.findTarget=["idle","cancelled"].includes(message.status)?"":(message.target||state.findTarget);
     if (state.goal && previousTarget!==state.findTarget && ws.readyState===WebSocket.OPEN) ws.send(JSON.stringify({type:"set_open_vocab",classes:[state.findTarget]}));
@@ -463,7 +527,30 @@ ws.onmessage=event=>{
   }
   else if(message.type==="memory_update"){refreshWorldMemory()}
   else if(message.type==="world_update"&&message.goal){state.goal=normalizeGoal(message.goal)||state.goal;renderAll()}
-};
+}
+
+function connectSocket() {
+  if (ws && [WebSocket.OPEN,WebSocket.CONNECTING].includes(ws.readyState)) return;
+  clearTimeout(reconnectTimer);
+  const socket=new WebSocket(`${wsScheme}://${location.host}/ws`);
+  ws=socket;
+  socket.onopen=()=>{
+    if (ws!==socket) return;
+    reconnectAttempt=0; state.socketOpen=true;
+    $("connection").className="connection live";$("connection").querySelector("span").textContent="Live";
+    const target=currentTarget();
+    if (target && state.finding) socket.send(JSON.stringify({type:"set_open_vocab",classes:[target]}));
+    refreshData();
+  };
+  socket.onmessage=handleSocketMessage;
+  socket.onerror=()=>{if(ws===socket){state.socketOpen=false;socket.close()}};
+  socket.onclose=()=>{
+    if (ws!==socket) return;
+    state.socketOpen=false;$("connection").className="connection off";$("connection").querySelector("span").textContent="Reconnecting";
+    const delay=Math.min(5000,500*(2**reconnectAttempt)); reconnectAttempt+=1;
+    reconnectTimer=setTimeout(connectSocket,delay);
+  };
+}
 
 $("queryForm").onsubmit=event=>{event.preventDefault();sendQuery($("query").value)};
 $("targetButton").onclick=()=>{const classes=$("targets").value.split(",").map(value=>value.trim()).filter(Boolean);const small=new Set(["key","keys","keychain","cell phone","remote","wallet","toothbrush","pen"]);runDetection(classes,!classes.some(item=>small.has(item.toLowerCase())))};
@@ -472,7 +559,8 @@ $("viewAll").onclick=()=>{state.showAll=!state.showAll;renderNearby()};
 $("dismissFocused").onclick=()=>{clearTimeout(state.focusedTimer);clearTimeout(state.findTimer);$("focusedResult").hidden=true;state.finding=false;if(!state.goal)state.findTarget="";if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:"set_open_vocab",classes:[]}));renderAll()};
 $("cancelGoal").onclick=async()=>{try{await fetch("/goal",{method:"DELETE"})}catch(_){}clearTimeout(state.findTimer);state.goal=null;state.findTarget="";if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:"set_open_vocab",classes:[]}));renderAll()};
 
-setupVoice(); renderAll(); refreshData();
+connectSocket(); setupVoice(); renderAll(); refreshData();
 setInterval(()=>{if(!state.socketOpen)camera.src=`/camera.jpg?t=${Date.now()}`},600);
 setInterval(refreshData,3000);
+setInterval(()=>{if(ws?.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:"ping"}))},15000);
 window.addEventListener("resize",renderCameraOverlay);
